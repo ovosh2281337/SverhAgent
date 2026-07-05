@@ -1,0 +1,29 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16   # postgres:16 + pgvector extension
+    environment:
+      POSTGRES_USER: kb
+      POSTGRES_PASSWORD: kb
+      POSTGRES_DB: kb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kb -d kb"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  bot:
+    build: .
+    command: python -m src.bot
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
