@@ -13,46 +13,46 @@ Telegram-агент для сбора экспертных знаний. Он в
 
 Главная идея: агент не просто задает вопросы и пишет лог. Каждый ответ эксперта
 становится частью управляемого процесса: сначала он попадает в неизменяемый
-транскрипт, затем проходит валидацию, grounding и только после этого становится
-видимой памятью для следующих интервью.
+транскрипт, затем проходит проверку формы и смысла, и только после этого
+становится видимой памятью для следующих интервью.
 
 ```mermaid
 flowchart TD
-    A["Эксперт в Telegram"] --> B["/start [topic]"]
-    B --> C["active session<br/>PostgreSQL + Telegram user_id"]
+    A["Эксперт в Telegram"] --> B["/start [тема]"]
+    B --> C["активная сессия<br/>PostgreSQL + Telegram user_id"]
     A --> D{"Сообщение эксперта"}
-    D -->|text| E["messages<br/>user turn"]
-    D -->|voice| V["STT service<br/>GigaAM v3 e2e-RNNT + Silero"]
+    D -->|текст| E["таблица messages<br/>реплика эксперта"]
+    D -->|голос| V["распознавание речи<br/>GigaAM v3 e2e-RNNT + Silero VAD"]
     V --> E
-    E --> F["STATE для следующего хода"]
+    E --> F["STATE<br/>контекст для следующего вопроса"]
 
-    F --> F1["plan_items"]
-    F --> F2["covered subtopics"]
-    F --> F3["topic_summaries"]
-    F --> F4["auto-RAG<br/>verified memory"]
-    F --> F5["token budget"]
+    F --> F1["план из plan_items"]
+    F --> F2["закрытые подтемы"]
+    F --> F3["сводка topic_summaries"]
+    F --> F4["поиск по памяти<br/>только проверенные факты"]
+    F --> F5["бюджет токенов"]
 
-    F --> G["LLM dialogue loop<br/>до 4 tool-раундов"]
-    G --> H["tools"]
-    H --> H1["update_plan"]
-    H --> H2["mark_covered"]
-    H --> H3["search_knowledge"]
-    H --> H4["web_search / web_fetch"]
-    H --> H5["end_session"]
+    F --> G["цикл чат-модели<br/>до 4 раундов с инструментами"]
+    G --> H["инструменты модели"]
+    H --> H1["update_plan<br/>обновить план"]
+    H --> H2["mark_covered<br/>отметить подтему"]
+    H --> H3["search_knowledge<br/>поиск по базе знаний"]
+    H --> H4["web_search / web_fetch<br/>проверка внешних фактов"]
+    H --> H5["end_session<br/>завершить интервью"]
 
     G --> I["Ответ агента"]
-    I --> I1["messages<br/>assistant turn + tool_calls"]
+    I --> I1["таблица messages<br/>ответ агента + вызовы инструментов"]
     I1 --> A
 
-    H5 --> J["finish_session"]
-    G -->|HARD_CAP_TOKENS| J
+    H5 --> J["сессия становится finished"]
+    G -->|лимит HARD_CAP_TOKENS| J
     A -->|/finish| J
-    J --> K["post-processing task"]
-    K --> L["extract.run"]
-    L --> M["summary.run"]
-    M --> N["recap to Telegram"]
-    N --> O["eval.run<br/>question_evals"]
-    M --> P["следующее интервью по topic<br/>видит verified memory"]
+    J --> K["фоновая обработка<br/>после интервью"]
+    K --> L["извлечение фактов<br/>src.jobs.extract"]
+    L --> M["пересборка сводки<br/>src.jobs.summary"]
+    M --> N["краткий отчет<br/>в Telegram"]
+    N --> O["оценка вопросов<br/>src.jobs.eval"]
+    M --> P["следующее интервью по теме<br/>видит проверенную память"]
 ```
 
 ### Один ход интервью
@@ -73,46 +73,61 @@ flowchart TD
 
 ### Что попадает в память
 
-После `/finish` или `end_session` запускается post-processing:
+После `/finish` или `end_session` запускается обработка записанного интервью:
 
 ```mermaid
 flowchart LR
-    A["messages"] --> B["chunking<br/>overlap 2 сообщения"]
-    B --> C["extract LLM<br/>raw candidates"]
-    C --> D["validator<br/>schema + exact spans + support_mode"]
-    D -->|valid| E["grounding judge"]
-    D -->|invalid| R["repair LLM<br/>one retry"]
-    E -->|verified| G["verified extracted_items<br/>visible memory"]
-    E -->|partial / rejected| R
-    R -->|verified after repair| G
-    R -->|partial / needs_review| H["review rows<br/>not visible to RAG"]
-    R -->|failed| I["extraction_rejections"]
-    G --> J{"embedding enabled?"}
-    J -->|yes| K["pgvector dedup<br/>contradiction judge"]
-    J -->|no| L["store without vector"]
-    K --> M["session status = extracted"]
+    A["таблица messages"] --> B["разбиение на чанки<br/>перехлест 2 сообщения"]
+    B --> C["модель предлагает факты<br/>сырые кандидаты"]
+    C --> D["строгая проверка формы<br/>типы, поля, цитаты, роли"]
+    D -->|прошло| E["проверка смысла<br/>следует ли факт из цитат"]
+    D -->|не прошло| R["попытка исправления<br/>модели дают причину отказа"]
+    E -->|доказано| G["extracted_items<br/>статус verified"]
+    E -->|спорно / не доказано| R
+    R -->|исправлено и доказано| G
+    R -->|частично / нужен просмотр| H["строки для ревью<br/>не видны поиску"]
+    R -->|не исправилось| I["журнал отказов<br/>extraction_rejections"]
+    G --> J{"эмбеддинги включены?"}
+    J -->|да| K["дедуп в pgvector<br/>проверка противоречий"]
+    J -->|нет| L["сохранить без вектора"]
+    K --> M["сессия получает<br/>статус extracted"]
     L --> M
     H --> M
     I --> M
-    M --> N["topic_summaries rebuild<br/>canonical verified only"]
-    A -.-> O["question_evals<br/>offline judge"]
+    M --> N["сводка topic_summaries<br/>только verified без дублей"]
+    A -.-> O["question_evals<br/>оценка вопросов отдельно"]
 ```
+
+Ключевые термины из схемы:
+
+- **строгая проверка формы**: обычный Python-код, не LLM. Он проверяет, что у
+  кандидата правильный JSON-вид: тип записи, нужные поля, допустимый способ
+  подтверждения и точные цитаты из `messages`.
+- **точные цитаты** (`provenance spans`): ссылка на сообщение плюс начало и конец
+  фразы внутри него. Так база знает не просто "модель сказала, что эксперт это
+  говорил", а где именно эксперт это сказал.
+- **проверка смысла** (`grounding`): отдельный LLM-судья проверяет, что
+  нормализованная запись действительно следует из этих цитат, без додумывания.
+- **статус `verified`**: запись прошла обе проверки и видна будущим интервью.
+  `partial` и `needs_review` сохраняются для аудита, но в поиск по памяти не
+  попадают.
 
 Правила видимости намеренно жесткие:
 
 | Слой | Для чего нужен | Видно агенту в следующих интервью |
 |------|----------------|------------------------------------|
-| `messages` | неизменяемый сырой транскрипт | нет, только через derived-слои |
+| `messages` | неизменяемый сырой транскрипт | нет, только через производные слои |
 | `extracted_items` `verified` | канонические факты, Q&A, термины | да |
 | `extracted_items` `partial/needs_review` | спорные или неполные извлечения | нет |
 | `extraction_rejections` | диагностика плохих кандидатов модели | нет |
 | `topic_summaries` | краткая память по теме | да |
-| `legacy` rows | старые записи после миграций | нет, пока не пройдут re-grounding |
+| строки `legacy` | старые записи после миграций | нет, пока не пройдут повторную проверку |
 
 Это защищает базу от типичной ошибки: цитата доказывает, что фраза была
-сказана, но не доказывает, что весь нормализованный payload из нее следует.
-Поэтому каждый item хранит provenance spans, `support_mode`,
-`grounding_status`, `grounding_version` и версию текста для embeddings.
+сказана, но не доказывает, что вся нормализованная запись из нее следует.
+Поэтому каждая запись хранит точные цитаты, способ подтверждения
+(`support_mode`), статус проверки (`grounding_status`) и версию правил проверки
+(`grounding_version`).
 
 ## Установка
 
@@ -473,45 +488,45 @@ python -m scripts.selftest --persona brew --turns 12 --postprocess
 
 Проверяются:
 
-- validation/grounding pipeline для extracted items;
-- visibility gates для RAG и summaries;
-- health/degraded поведение embeddings;
-- lifecycle locks вокруг `/finish`, `/reset` и входящих сообщений;
-- Telegram identity по `user_id`, а не display name;
-- preflight и PowerShell launcher scripts.
+- проверка формы и смысла для записей `extracted_items`;
+- правила видимости для RAG и сводок;
+- поведение embeddings при нормальной работе и деградации;
+- блокировки жизненного цикла вокруг `/finish`, `/reset` и входящих сообщений;
+- привязка Telegram-пользователя по `user_id`, а не по отображаемому имени;
+- preflight-проверки и PowerShell-скрипты запуска.
 
 ## Структура проекта
 
 ```text
 src/
-  agent.py          один ход интервью: STATE -> LLM loop -> запись результата
-  bot.py            Telegram handlers, lifecycle locks, post-processing trigger
-  config.py         env parsing и режимы embeddings/STT/search
-  db.py             asyncpg wrapper, миграции, memory queries
-  embed.py          OpenAI-compatible embeddings client + health metrics
-  llm.py            OpenAI-compatible chat client и tool loop
-  prompts.py        системные промпты интервью, extraction, grounding, eval
+  agent.py          один ход интервью: STATE -> цикл LLM -> запись результата
+  bot.py            Telegram-обработчики, блокировки, запуск обработки после интервью
+  config.py         чтение env и режимы embeddings/STT/search
+  db.py             asyncpg-обертка, миграции, запросы к памяти
+  embed.py          клиент embeddings и проверка здоровья endpoint
+  llm.py            клиент чат-модели и цикл вызова инструментов
+  prompts.py        системные промпты интервью, извлечения, проверки смысла и оценки
   state.py          сбор компактного STATE для модели
-  tools.py          tool schemas и применение tool calls
-  websearch.py      Tavily search/fetch adapter
+  tools.py          описания инструментов и применение их вызовов
+  websearch.py      адаптер Tavily search/fetch
   jobs/
-    extract.py      transcript -> grounded extracted_items
+    extract.py      транскрипт -> проверенные extracted_items
     summary.py      пересборка topic_summaries
     eval.py         оценка вопросов агента
 
 scripts/
-  setup.ps1         venv, dependencies, .env, Postgres, optional model weights
-  run.ps1           строгий launcher с preflight, mutex и watchdog
+  setup.ps1         venv, зависимости, .env, Postgres, опциональные веса моделей
+  run.ps1           строгий запуск с preflight, mutex и watchdog
   preflight.py      проверки runtime/config/model/ports/health
-  serve_embed.py    локальный embeddings endpoint
+  serve_embed.py    локальный endpoint для embeddings
   serve_stt.py      локальный STT endpoint
-  selftest.py       end-to-end симуляция интервью
-  view.py           просмотр extracted memory
+  selftest.py       сквозная симуляция интервью
+  view.py           просмотр извлеченной памяти
   stats.py          наблюдаемость по сессиям
   export.py         экспорт базы знаний темы в Markdown
 
 migrations/         SQL-миграции PostgreSQL/pgvector
-tests/              unit/integration-style тесты без живого Telegram/LLM
+tests/              unit- и integration-style тесты без живого Telegram/LLM
 ```
 
 ## Границы текущего прототипа
@@ -520,4 +535,4 @@ tests/              unit/integration-style тесты без живого Telegr
 - Web search включается только при наличии `TAVILY_API_KEY`.
 - Пользовательский RAG/LoRA слой поверх собранной базы не реализован.
 - GraphRAG намеренно не добавлен: на масштабе десятков или сотен записей
-  typed items + pgvector + связи `duplicate_of`/`contradicts` проще и надежнее.
+  типизированные записи + pgvector + связи `duplicate_of`/`contradicts` проще и надежнее.
