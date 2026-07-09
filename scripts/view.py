@@ -8,23 +8,44 @@ import sys
 from src import db
 
 
+def _json(value, fallback):
+    if value is None:
+        return fallback
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
+
+
 async def main() -> None:
     topic = sys.argv[1] if len(sys.argv) > 1 else "default"
     rows = await db.all_for_topic(topic)
 
     print(f"=== Извлечённые элементы (тема: {topic}, всего {len(rows)}) ===\n")
     for r in rows:
-        payload = r["payload"]
-        if isinstance(payload, str):
-            payload = json.loads(payload)
-        tags = [r["origin"]]
+        payload = _json(r["payload"], {})
+        tags = [r["origin"], f"grounding={r['grounding_status']}"]
+        if r["support_mode"]:
+            tags.append(f"support={r['support_mode']}")
         if r["duplicate_of"]:
             tags.append(f"дубль #{r['duplicate_of']}")
         else:
             tags.append(f"подтв.={r['confirmation_count']}")
         print(f"[{r['type']} | {' | '.join(tags)}] {r['expert_name']}")
         print(f"  {json.dumps(payload, ensure_ascii=False)}")
-        print(f"  цитата: {r['quote']}\n")
+        details = _json(r["grounding_details"], {})
+        if details:
+            print(f"  grounding_details: {json.dumps(details, ensure_ascii=False)}")
+        provenance = _json(r["provenance"], [])
+        if provenance:
+            print("  provenance:")
+            for span in provenance:
+                print(
+                    f"    - #{span.get('message_id')} {span.get('kind')}: "
+                    f"{span.get('quote')}"
+                )
+        else:
+            print(f"  legacy_quote: {r['quote']}")
+        print()
 
     summary = await db.topic_summary(topic)
     print("=== Сводка по теме ===\n")

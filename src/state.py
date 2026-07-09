@@ -6,15 +6,41 @@ whole base — that provokes questionnaire mode over deep interview, and the age
 can pull the rest just-in-time via search_knowledge.
 """
 import json
+import re
 
 from . import config, db, embed
 
-# ~800-token budget for the summary excerpt. Russian runs ~2 chars/token, so
-# ~1600 chars. Full summary in the DB can grow unbounded; this is only the tail
-# that rides in the prompt.
-_SUMMARY_CAP = 1600
-_RAG_ITEMS = 4        # cross-session facts pulled per turn
-_RAG_ITEM_CHARS = 160  # each trimmed to this
+# ~1000-token budget for the summary excerpt. Russian runs ~2 chars/token, so
+# ~2000 chars. Full summary in the DB can grow unbounded; this is only the
+# excerpt that rides in the prompt (priority sections first, see _summary_excerpt).
+_SUMMARY_CAP = 2000
+_RAG_ITEMS = 6         # cross-session facts pulled per turn
+# Per-fact trim. Median full gist (statement + qualifiers) is ~190 chars and
+# p90 ~250: at 160 two thirds of facts lost their tail — and qualifiers, glued
+# on last, went first. 300 fits ~97% of facts whole.
+_RAG_ITEM_CHARS = 300
+
+
+def _summary_excerpt(summary: str) -> str:
+    """Budget-trim the topic summary WITHOUT losing its most valuable part.
+
+    The summary prompt puts «Открытые вопросы» and «Противоречия» at the tail,
+    so a naive head-slice fed the agent only confirmed statements and silently
+    dropped exactly the sections STATE tells it to build the plan around. Pull
+    the priority sections whole first, then spend what's left of the budget on
+    the head of the rest."""
+    sections = re.split(r"(?m)^(?=##\s)", summary)
+    prio_re = re.compile(r"^##\s*(Открыт|Противореч)", re.I)
+    prio = [s.strip() for s in sections if prio_re.match(s)]
+    rest = [s.strip() for s in sections if not prio_re.match(s)]
+    out = "\n\n".join(prio)
+    if len(out) >= _SUMMARY_CAP:
+        return out[:_SUMMARY_CAP] + " …[обрезано — детали через search_knowledge]"
+    budget = _SUMMARY_CAP - len(out)
+    head = "\n\n".join(rest)
+    if len(head) > budget:
+        head = head[:budget] + " …[обрезано — детали через search_knowledge]"
+    return f"{out}\n\n{head}" if out else head
 
 
 def _item_gist(payload) -> str:
@@ -26,6 +52,14 @@ def _item_gist(payload) -> str:
     if q:
         text = f"{text} ({q})"
     return text[:_RAG_ITEM_CHARS]
+
+
+def _row_gist(r) -> str:
+    text = _item_gist(r["payload"])
+    mode = r["support_mode"] or "unknown"
+    conf = r["confirmation_count"] or 1
+    origin = "гипотеза" if r["origin"] == "confirmed_hypothesis" else "факт"
+    return f"{text} [origin={origin}; support={mode}; подтверждений={conf}]"
 
 
 async def _auto_rag(session_id: int, topic: str, last_expert_text: str) -> list[str]:
@@ -58,7 +92,7 @@ async def _auto_rag(session_id: int, topic: str, last_expert_text: str) -> list[
             "Из базы — ЭТОТ ЖЕ эксперт уже говорил в прошлых сессиях",
             "(не переспрашивай то же самое; ссылайся и копай глубже/новое):",
         ]
-        out += [f"  - {_item_gist(r['payload'])}" for r in mine]
+        out += [f"  - {_row_gist(r)}" for r in mine]
     if others:
         out += [
             "",
@@ -66,7 +100,7 @@ async def _auto_rag(session_id: int, topic: str, last_expert_text: str) -> list[
             "не приписывай текущему эксперту):",
         ]
         out += [
-            f"  - [эксперт {r['expert_name']}] {_item_gist(r['payload'])}"
+            f"  - [эксперт {r['expert_name']}] {_row_gist(r)}"
             for r in others
         ]
     return out
@@ -99,9 +133,7 @@ async def build(
 
     summary = await db.topic_summary(topic)
     if summary:
-        trimmed = summary[:_SUMMARY_CAP]
-        if len(summary) > _SUMMARY_CAP:
-            trimmed += " …[обрезано — детали через search_knowledge]"
+        trimmed = _summary_excerpt(summary)
         lines.append("")
         lines.append("Сводка по теме из прошлых сессий (строй план вокруг")
         lines.append("открытых вопросов и противоречий; детали — search_knowledge):")

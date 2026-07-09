@@ -70,10 +70,15 @@ async def dialogue(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
     apply_tool,  # async (name, args) -> str; may raise to abort the turn
+    rounds_out: Optional[list[dict]] = None,  # per-round trace, appended in place
 ) -> tuple[str, int]:
     """Run one interview turn: the model may call tools, then produces the
     question. `messages` (incl. the system message) is mutated in place with
     assistant/tool turns. Returns (final visible text, tokens spent this turn).
+
+    If `rounds_out` is given, one dict per completion round is appended to it
+    ({n, tokens, tools, final}) so verbose mode can show the model's step-by-step
+    reasoning loop, not just the final tool set.
     """
     tokens = 0
     for round_ in range(MAX_TOOL_ROUNDS + 1):
@@ -84,6 +89,13 @@ async def dialogue(
         resp = await _complete(config.DIALOG_MODEL, messages, extra)
         tokens += _usage(resp)
         msg = resp.choices[0].message
+        if rounds_out is not None:
+            rounds_out.append({
+                "n": round_ + 1,
+                "tokens": _usage(resp),
+                "tools": [tc.function.name for tc in (msg.tool_calls or [])],
+                "final": not msg.tool_calls,
+            })
         if not msg.tool_calls:
             return (msg.content or "").strip(), tokens
 
@@ -181,6 +193,62 @@ async def extract(user: str) -> list[dict]:
                 return salvaged
             if attempt == 1:
                 raise
+    return []
+
+
+async def ground_extraction(user: str) -> dict:
+    """Adversarial semantic-grounding verdict. Malformed judge output is a
+    hard failure: publishing without a valid verdict would silently bypass the
+    trust boundary. One fresh completion is allowed before failing closed."""
+    from . import prompts
+
+    last_error: Exception | None = None
+    for _ in range(2):
+        try:
+            data = await _json_call(
+                config.GROUND_MODEL, prompts.GROUNDING_SYSTEM, user
+            )
+            if not isinstance(data, dict):
+                raise ValueError("grounding verdict is not an object")
+            if data.get("verdict") not in {"verified", "partial", "rejected"}:
+                raise ValueError("grounding verdict is unknown")
+            if not isinstance(data.get("reason"), str) or not data["reason"].strip():
+                raise ValueError("grounding reason is empty")
+            unsupported = data.get("unsupported_atoms")
+            if not isinstance(unsupported, list) or not all(
+                isinstance(atom, str) for atom in unsupported
+            ):
+                raise ValueError("unsupported_atoms must be a string array")
+            if not isinstance(data.get("ambiguous"), bool):
+                raise ValueError("grounding ambiguous must be boolean")
+            return {
+                "verdict": data["verdict"],
+                "reason": data["reason"].strip(),
+                "unsupported_atoms": [a.strip() for a in unsupported if a.strip()],
+                "ambiguous": data["ambiguous"],
+            }
+        except (json.JSONDecodeError, ValueError) as exc:
+            last_error = exc
+    raise ValueError("grounding judge returned invalid JSON twice") from last_error
+
+
+async def repair_extraction(user: str) -> list[dict]:
+    """One candidate-level repair. The caller records the original candidate
+    when this returns no usable items, so malformed model output is observable
+    rather than silently discarded."""
+    from . import prompts
+
+    for _ in range(2):
+        text = await _content(
+            config.EXTRACT_MODEL, prompts.REPAIR_EXTRACTION_SYSTEM, user
+        )
+        try:
+            data = json.loads(_strip_fence(text))
+            return data if isinstance(data, list) else []
+        except json.JSONDecodeError:
+            salvaged = _salvage_array(text)
+            if salvaged:
+                return salvaged
     return []
 
 

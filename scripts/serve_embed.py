@@ -1,27 +1,67 @@
-"""Minimal OpenAI-compatible /v1/embeddings server for harrier-oss-v1-270m.
+"""OpenAI-compatible /v1/embeddings server for harrier-oss-v1-270m.
 
-Loads the local sentence-transformers model (last-token pooling + L2 norm, dim
-640, cosine) and exposes exactly the shape the openai SDK's embeddings.create
-expects. Prompts are NOT applied here: src/embed.py prepends the retrieval
-instruct prefix for queries and sends documents raw, so this server encodes
-input verbatim (default_prompt_name is null in the model config — no auto-prompt).
+Loads the local sentence-transformers model (last-token pooling, L2 norm, dim
+640, cosine) and exposes the response shape expected by the OpenAI SDK.
 
-Run:  python -m scripts.serve_embed
-Then set in .env:  EMBED_BASE_URL=http://localhost:8300/v1
+Run:
+    python -m scripts.serve_embed
+
+Then use:
+    EMBED_MODE=bundled
+    EMBED_BASE_URL=http://127.0.0.1:8300/v1
 """
+
+from __future__ import annotations
+
 import os
 import time
 
+from dotenv import load_dotenv
 import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 
+
+load_dotenv()
+
 MODEL_DIR = os.getenv("EMBED_MODEL_DIR", "models/harrier-oss-v1-270m")
 PORT = int(os.getenv("EMBED_PORT", "8300"))  # 8044-8143/8144-8243 are Windows-reserved
 
-_device = "cuda" if os.getenv("EMBED_DEVICE", "cuda") == "cuda" else "cpu"
-print(f"loading {MODEL_DIR} on {_device} …")
+
+def _resolve_device() -> str:
+    requested = os.getenv("EMBED_DEVICE", "auto").strip().lower() or "auto"
+    if requested not in {"auto", "cpu", "cuda"}:
+        raise RuntimeError("EMBED_DEVICE must be one of: auto, cpu, cuda")
+    if requested == "cpu":
+        return "cpu"
+
+    try:
+        import torch
+    except Exception as exc:
+        if requested == "cuda":
+            raise RuntimeError("EMBED_DEVICE=cuda but torch is not importable") from exc
+        print("CUDA check unavailable, using CPU for bundled embeddings")
+        return "cpu"
+
+    has_cuda = bool(torch.cuda.is_available())
+    if requested == "cuda":
+        if not has_cuda:
+            raise RuntimeError(
+                "EMBED_DEVICE=cuda but CUDA is unavailable; "
+                "set EMBED_DEVICE=auto or EMBED_DEVICE=cpu"
+            )
+        return "cuda"
+
+    if has_cuda:
+        print("CUDA available, using CUDA for bundled embeddings")
+        return "cuda"
+    print("CUDA unavailable, using CPU for bundled embeddings; startup and latency may be slower")
+    return "cpu"
+
+
+_device = _resolve_device()
+print(f"loading {MODEL_DIR} on {_device} ...")
 _model = SentenceTransformer(MODEL_DIR, device=_device)
 print(f"loaded. dim={_model.get_sentence_embedding_dimension()}")
 
@@ -35,17 +75,18 @@ class EmbedRequest(BaseModel):
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "dim": _model.get_sentence_embedding_dimension()}
+    return {
+        "status": "ok",
+        "dim": _model.get_sentence_embedding_dimension(),
+        "device": _device,
+        "model_dir": MODEL_DIR,
+    }
 
 
 @app.post("/v1/embeddings")
 def embeddings(req: EmbedRequest) -> dict:
     texts = [req.input] if isinstance(req.input, str) else req.input
-    # normalize_embeddings: the model's own Normalize module already L2-norms,
-    # but pass it explicitly so cosine == dot regardless of module wiring.
-    vecs = _model.encode(
-        texts, normalize_embeddings=True, convert_to_numpy=True
-    )
+    vecs = _model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
     data = [
         {"object": "embedding", "index": i, "embedding": v.tolist()}
         for i, v in enumerate(vecs)

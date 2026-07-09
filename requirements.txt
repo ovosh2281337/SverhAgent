@@ -5,7 +5,5 @@ asyncpg>=0.30
 pgvector>=0.3
 huggingface_hub>=0.25
 python-dotenv>=1.0
-# Local embedding serving (scripts/serve_embed.py): harrier via sentence-transformers
-sentence-transformers>=5.0
 fastapi>=0.115
 uvicorn>=0.30

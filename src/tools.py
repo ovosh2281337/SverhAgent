@@ -146,10 +146,15 @@ async def _search_knowledge(topic: str, query: str) -> str:
         if isinstance(payload, str):
             payload = json.loads(payload)
         origin = "гипотеза" if r["origin"] == "confirmed_hypothesis" else "факт"
+        quote = (r["quote"] or "").strip()
+        if len(quote) > 260:
+            quote = quote[:260] + "…"
         out.append(
-            f"- [{r['type']}/{origin}, подтверждений={r['confirmation_count']}, "
+            f"- [{r['type']}/{origin}, support={r['support_mode']}, "
+            f"подтверждений={r['confirmation_count']}, "
             f"эксперт={r['expert_name']}] "
-            f"{json.dumps(payload, ensure_ascii=False)} | цитата: {r['quote']}"
+            f"{json.dumps(payload, ensure_ascii=False)}"
+            + (f" | expert_span: {quote}" if quote else "")
         )
     return "Найдено в базе:\n" + "\n".join(out)
 

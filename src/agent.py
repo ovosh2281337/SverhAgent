@@ -9,7 +9,10 @@ log = logging.getLogger("agent")
 
 async def _build_messages(
     session_id: int, topic: str, tokens_used: int
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], str]:
+    """Returns (messages, state_block). The state block is handed back separately
+    so callers can surface it (verbose/debug mode shows the exact context the
+    model saw), not just embed it into the prompt."""
     rows = await db.history(session_id)
     # System prompt is stable; the dynamic STATE block rides on the tail of the
     # last user turn (keeps the system message stable, injects fresh state).
@@ -28,13 +31,17 @@ async def _build_messages(
             msg["content"] = f"{msg['content']}\n\n{state_block}"
             break
     messages.extend(turns)
-    return messages
+    return messages, state_block
 
 
-async def run_turn(session_id: int, topic: str) -> tuple[str, bool]:
-    """Produce the next agent message. Returns (text, session_finished)."""
+async def run_turn(session_id: int, topic: str) -> tuple[str, bool, dict[str, Any]]:
+    """Produce the next agent message.
+
+    Returns (text, session_finished, trace). `trace` exposes what happened this
+    turn for observability/verbose mode: the tool calls made (name + args), the
+    STATE context fed to the model, and the token spend."""
     tokens_used = await db.session_tokens(session_id)
-    messages = await _build_messages(session_id, topic, tokens_used)
+    messages, state_block = await _build_messages(session_id, topic, tokens_used)
 
     ended = {"summary": None}
     used: list[dict[str, Any]] = []  # tool calls this turn, for persistence/observability
@@ -53,18 +60,25 @@ async def run_turn(session_id: int, topic: str) -> tuple[str, bool]:
             log.exception("tool failed: %s", name)
             return f"тул {name} упал с внутренней ошибкой — продолжай без него"
 
-    text, spent = await llm.dialogue(messages, tools.active_tools(), apply_tool)
+    rounds: list[dict[str, Any]] = []
+    text, spent = await llm.dialogue(
+        messages, tools.active_tools(), apply_tool, rounds_out=rounds
+    )
     total = await db.add_tokens(session_id, spent)
     if used:
         log.info("session=%s tools=%s spent=%s total=%s",
                  session_id, [u["name"] for u in used], spent, total)
     tool_calls = used or None
+    trace = {
+        "tools": used, "state": state_block, "spent": spent,
+        "total": total, "rounds": rounds,
+    }
 
     if ended["summary"] is not None:
         final = ended["summary"] or text or "Спасибо, на этом закончим."
         await db.add_message(session_id, "assistant", final, tool_calls=tool_calls)
         await db.finish_session(session_id)
-        return final, True
+        return final, True, trace
 
     await db.add_message(session_id, "assistant", text, tool_calls=tool_calls)
 
@@ -72,6 +86,6 @@ async def run_turn(session_id: int, topic: str) -> tuple[str, bool]:
     # the session ourselves (the STATE instruction is the softer first line).
     if config.HARD_CAP_TOKENS and total >= config.HARD_CAP_TOKENS:
         await db.finish_session(session_id)
-        return text, True
+        return text, True, trace
 
-    return text, False
+    return text, False, trace

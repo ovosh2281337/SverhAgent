@@ -1,0 +1,3 @@
+# Optional local embeddings service (scripts/serve_embed.py).
+# Install only if you use EMBED_MODE=bundled.
+sentence-transformers>=5.0

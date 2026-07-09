@@ -1,8 +1,9 @@
 """Backfill embeddings for extracted_items collected while embeddings were off.
 
-Existing rows have embedding IS NULL, so search_knowledge can't find them. This
-recomputes each from the same doc text the insert path uses (retrieval_question
-+ payload + quote) and writes it back. Idempotent: only touches NULL rows.
+Existing verified rows can have embedding IS NULL, so search_knowledge can't
+find them. This recomputes each from the same doc text the insert path uses
+(retrieval_question + payload + verified expert support spans) and writes it
+back. Legacy/partial/needs_review rows stay unpublished and are skipped.
 
 Run: python -m scripts.backfill_embeddings           # only rows with NULL vector
      python -m scripts.backfill_embeddings --stale   # rows whose embed_version
@@ -27,17 +28,39 @@ from src.jobs.extract import _embed_text
 
 async def main() -> None:
     if not embed.enabled():
-        print("embeddings disabled (set EMBED_BASE_URL) — nothing to do")
+        print("embeddings disabled (set EMBED_MODE=bundled or external) - nothing to do")
         return
     p = await db.pool()
     if "--all" in sys.argv:
-        where, args = "", ()
+        where, args = (
+            "WHERE e.grounding_status='verified' AND e.grounding_version=$1",
+            (config.GROUNDING_VERSION,),
+        )
     elif "--stale" in sys.argv:
-        where, args = "WHERE embed_version IS DISTINCT FROM $1", (config.EMBED_TEXT_VERSION,)
+        where, args = (
+            "WHERE e.grounding_status='verified' AND e.grounding_version=$1 "
+            "AND e.embed_version IS DISTINCT FROM $2",
+            (config.GROUNDING_VERSION, config.EMBED_TEXT_VERSION),
+        )
     else:
-        where, args = "WHERE embedding IS NULL", ()
+        where, args = (
+            "WHERE e.grounding_status='verified' AND e.grounding_version=$1 "
+            "AND e.embedding IS NULL",
+            (config.GROUNDING_VERSION,),
+        )
     rows = await p.fetch(
-        f"SELECT id, payload, quote FROM extracted_items {where}", *args
+        "SELECT e.id, e.payload, "
+        "       COALESCE(( "
+        "         SELECT jsonb_agg(substring(m.content FROM pr.start_char + 1 "
+        "                                    FOR pr.end_char - pr.start_char) "
+        "                          ORDER BY pr.ord) "
+        "         FROM extracted_item_provenance pr "
+        "         JOIN messages m ON m.id=pr.message_id "
+        "         WHERE pr.item_id=e.id "
+        "           AND pr.kind IN ('user_support','confirmation') "
+        "       ), '[]'::jsonb) AS support_quotes "
+        f"FROM extracted_items e {where}",
+        *args,
     )
     print(f"{len(rows)} rows to backfill (target version {config.EMBED_TEXT_VERSION})")
     done = 0
@@ -45,10 +68,12 @@ async def main() -> None:
         payload = r["payload"]
         if isinstance(payload, str):
             payload = json.loads(payload)
-        vec = await embed.embed(_embed_text(payload, r["quote"] or ""))
-        if vec is None:
-            print(f"  skip #{r['id']}: embed failed")
-            continue
+        support_quotes = r["support_quotes"]
+        if isinstance(support_quotes, str):
+            support_quotes = json.loads(support_quotes)
+        vec = await embed.embed(
+            _embed_text(payload, support_quotes), required=True
+        )
         await p.execute(
             "UPDATE extracted_items SET embedding=$2, embed_version=$3 WHERE id=$1",
             r["id"], vec, config.EMBED_TEXT_VERSION,

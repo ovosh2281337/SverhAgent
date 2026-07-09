@@ -18,12 +18,19 @@ services:
 
   bot:
     build: .
-    command: python -m src.bot
+    # This compose file does not start bundled embeddings. In Docker use either:
+    #   EMBED_MODE=disabled
+    #   EMBED_MODE=external with EMBED_BASE_URL=http://host.docker.internal:8300/v1
+    command: sh -c "python -m scripts.preflight runtime && python -m scripts.preflight config --docker && python -m src.bot"
     env_file: .env
+    # Override the .env DATABASE_URL: inside the compose network the DB host is
+    # "db", not "localhost". .env keeps localhost so a locally-run bot works too.
+    environment:
+      DATABASE_URL: postgresql://kb:kb@db:5432/kb
     depends_on:
       db:
         condition: service_healthy
-    restart: unless-stopped
+    restart: on-failure:5
 
 volumes:
   pgdata:

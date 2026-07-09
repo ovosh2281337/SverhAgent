@@ -1,0 +1,4 @@
+# Optional voice-message STT service (scripts/serve_stt.py).
+# Install only if you want Telegram voice transcription.
+gigaam @ git+https://github.com/salute-developers/GigaAM.git
+silero-vad>=6.2.1

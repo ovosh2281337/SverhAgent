@@ -125,7 +125,7 @@ async def run(topic: str, persona_key: str, turns: int, postprocess: bool) -> No
         print(f"ЭКСПЕРТ: {expert_text}\n")
         await db.add_message(sid, "user", expert_text)
         t0 = time.monotonic()
-        text, finished = await agent.run_turn(sid, topic)
+        text, finished, _ = await agent.run_turn(sid, topic)
         dt = time.monotonic() - t0
         used = await _last_tool_calls(sid)
         tools_note = f"  [тулы: {', '.join(used)}]" if used else ""
@@ -147,7 +147,23 @@ async def run(topic: str, persona_key: str, turns: int, postprocess: bool) -> No
         n = await extract.run(sid)
         await summary.run(topic)
         scored = await evaljob.run(sid)
-        print(f"извлечено={n}, вопросов оценено={scored}")
+        p = await db.pool()
+        audit = await p.fetchrow(
+            "SELECT count(*) FILTER (WHERE grounding_status='verified') AS verified, "
+            "       count(*) FILTER (WHERE grounding_status IN ('partial','needs_review')) AS review "
+            "FROM extracted_items WHERE session_id=$1",
+            sid,
+        )
+        rejections = await p.fetchval(
+            "SELECT count(*) FROM extraction_rejections WHERE session_id=$1", sid
+        )
+        print(
+            f"извлечено={n}, "
+            f"verified={audit['verified'] if audit else 0}, "
+            f"review={audit['review'] if audit else 0}, "
+            f"rejections={rejections}, "
+            f"вопросов оценено={scored}"
+        )
         rows = await db.extracted_for_session(sid)
         for r in rows:
             payload = r["payload"]

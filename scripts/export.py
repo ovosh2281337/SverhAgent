@@ -10,6 +10,7 @@ import asyncio
 import json
 import sys
 from datetime import date
+from pathlib import Path
 
 from src import db
 
@@ -19,13 +20,41 @@ def _payload(r) -> dict:
     return json.loads(p) if isinstance(p, str) else p
 
 
+def _json(value, fallback):
+    if value is None:
+        return fallback
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
+
+
 def _reliability(r) -> str:
     tags = []
     if r["origin"] == "confirmed_hypothesis":
         tags.append("подтверждённая гипотеза — слабый вес")
+    if r["support_mode"]:
+        tags.append(f"support={r['support_mode']}")
     if r["confirmation_count"] > 1:
         tags.append(f"подтверждено ×{r['confirmation_count']}")
     return f" _({'; '.join(tags)})_" if tags else ""
+
+
+def _support_lines(r, limit: int = 2) -> list[str]:
+    supports = _json(r["supports"], [])
+    lines: list[str] = []
+    for s in supports[:limit]:
+        quote = (s.get("quote") or "").strip()
+        if not quote:
+            continue
+        if len(quote) > 220:
+            quote = quote[:220] + "…"
+        who = s.get("expert_name") or r["expert_name"]
+        kind = s.get("kind") or "support"
+        lines.append(f"  - evidence/{kind}: {who} — «{quote}»")
+    if not lines and r["quote"]:
+        quote = r["quote"][:220] + ("…" if len(r["quote"]) > 220 else "")
+        lines.append(f"  - evidence: {r['expert_name']} — «{quote}»")
+    return lines
 
 
 def _render(topic: str, rows, summary: str | None) -> str:
@@ -53,7 +82,7 @@ def _render(topic: str, rows, summary: str | None) -> str:
             out.append(f"- {line}{_reliability(r)}")
             if p.get("contradicts") or p.get("contradicts_self"):
                 out.append("  - ⚠ есть противоречие с другой записью")
-            out.append(f"  - источник: {r['expert_name']} — «{r['quote'][:220]}»")
+            out.extend(_support_lines(r))
         out.append("")
 
     if qas:
@@ -62,7 +91,7 @@ def _render(topic: str, rows, summary: str | None) -> str:
             p = _payload(r)
             out.append(f"- **{p.get('question','')}**{_reliability(r)}")
             out.append(f"  - {p.get('answer','')}")
-            out.append(f"  - источник: {r['expert_name']}")
+            out.extend(_support_lines(r))
         out.append("")
 
     if terms:
@@ -73,6 +102,7 @@ def _render(topic: str, rows, summary: str | None) -> str:
                 f"- **{p.get('term','')}** — {p.get('definition','')}"
                 f"{_reliability(r)} _(источник: {r['expert_name']})_"
             )
+            out.extend(_support_lines(r))
         out.append("")
 
     return "\n".join(out)
@@ -88,7 +118,10 @@ async def main() -> None:
         await db.close()
         return
     text = _render(topic, rows, summary)
-    with open(outfile, "w", encoding="utf-8") as f:
+    outpath = Path(outfile)
+    if outpath.parent != Path("."):
+        outpath.parent.mkdir(parents=True, exist_ok=True)
+    with outpath.open("w", encoding="utf-8") as f:
         f.write(text)
     print(f"экспортировано {len(rows)} записей -> {outfile}")
     await db.close()
