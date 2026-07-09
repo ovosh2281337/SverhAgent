@@ -18,17 +18,19 @@ Telegram-агент для сбора экспертных знаний. Он в
 
 ```mermaid
 flowchart TD
-    A["Эксперт в Telegram"] --> B["/start topic"]
-    B --> C["Сессия в PostgreSQL<br/>owner = Telegram user_id"]
-    A --> D["Сообщение эксперта"]
-    D --> E["messages<br/>сырой транскрипт"]
+    A["Эксперт в Telegram"] --> B["/start [topic]"]
+    B --> C["active session<br/>PostgreSQL + Telegram user_id"]
+    A --> D{"Сообщение эксперта"}
+    D -->|text| E["messages<br/>user turn"]
+    D -->|voice| V["STT service<br/>GigaAM v3 e2e-RNNT + Silero"]
+    V --> E
     E --> F["STATE для следующего хода"]
 
-    F --> F1["план интервью"]
-    F --> F2["покрытые подтемы"]
-    F --> F3["сводка прошлых сессий"]
-    F --> F4["auto-RAG по последней реплике"]
-    F --> F5["токен-бюджет"]
+    F --> F1["plan_items"]
+    F --> F2["covered subtopics"]
+    F --> F3["topic_summaries"]
+    F --> F4["auto-RAG<br/>verified memory"]
+    F --> F5["token budget"]
 
     F --> G["LLM dialogue loop<br/>до 4 tool-раундов"]
     G --> H["tools"]
@@ -39,19 +41,18 @@ flowchart TD
     H --> H5["end_session"]
 
     G --> I["Ответ агента"]
-    I --> E
+    I --> I1["messages<br/>assistant turn + tool_calls"]
+    I1 --> A
 
-    H5 --> J["finished"]
-    J --> K["extract transcript chunks"]
-    K --> L["deterministic validation<br/>schema + provenance spans"]
-    L --> M["semantic grounding judge"]
-    M --> N{"verdict"}
-    N -->|verified| O["publish extracted_items"]
-    N -->|partial| P["needs_review<br/>не виден в RAG"]
-    N -->|rejected| Q["extraction_rejections"]
-    O --> R["pgvector dedup<br/>contradiction check"]
-    R --> S["topic_summaries rebuild"]
-    S --> T["следующее интервью по topic<br/>уже видит память"]
+    H5 --> J["finish_session"]
+    G -->|HARD_CAP_TOKENS| J
+    A -->|/finish| J
+    J --> K["post-processing task"]
+    K --> L["extract.run"]
+    L --> M["summary.run"]
+    M --> N["recap to Telegram"]
+    N --> O["eval.run<br/>question_evals"]
+    M --> P["следующее интервью по topic<br/>видит verified memory"]
 ```
 
 ### Один ход интервью
@@ -78,19 +79,23 @@ flowchart TD
 flowchart LR
     A["messages"] --> B["chunking<br/>overlap 2 сообщения"]
     B --> C["extract LLM<br/>raw candidates"]
-    C --> D["validator"]
-    D --> D1["строгий payload schema"]
-    D --> D2["точные quote offsets"]
-    D --> D3["agent text не evidence"]
-    D --> D4["support_mode contract"]
-    D --> E["grounding judge"]
-    E --> F{"status"}
-    F -->|verified| G["visible memory"]
-    F -->|partial| H["audit only"]
-    F -->|rejected| I["rejection log"]
-    G --> J["embedding"]
-    J --> K["dedup / contradiction"]
-    K --> L["topic summary"]
+    C --> D["validator<br/>schema + exact spans + support_mode"]
+    D -->|valid| E["grounding judge"]
+    D -->|invalid| R["repair LLM<br/>one retry"]
+    E -->|verified| G["verified extracted_items<br/>visible memory"]
+    E -->|partial / rejected| R
+    R -->|verified after repair| G
+    R -->|partial / needs_review| H["review rows<br/>not visible to RAG"]
+    R -->|failed| I["extraction_rejections"]
+    G --> J{"embedding enabled?"}
+    J -->|yes| K["pgvector dedup<br/>contradiction judge"]
+    J -->|no| L["store without vector"]
+    K --> M["session status = extracted"]
+    L --> M
+    H --> M
+    I --> M
+    M --> N["topic_summaries rebuild<br/>canonical verified only"]
+    A -.-> O["question_evals<br/>offline judge"]
 ```
 
 Правила видимости намеренно жесткие:
