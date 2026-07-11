@@ -40,25 +40,23 @@ class LifecycleLockTests(unittest.IsolatedAsyncioTestCase):
         lock = bot._lock(sess["id"])
         await lock.acquire()
 
-        async def _noop_postprocess(*_args, **_kwargs):
-            return None
-
         with (
             patch.object(bot, "_active_session_for_msg", AsyncMock(return_value=sess)),
             patch.object(db, "get_session", AsyncMock(return_value=sess)),
-            patch.object(db, "finish_session", AsyncMock()) as finish_session,
-            patch.object(bot, "_postprocess", _noop_postprocess),
+            patch.object(db, "begin_review", AsyncMock(return_value=True)) as begin_review,
+            patch.object(bot, "_show_review", AsyncMock()) as show_review,
         ):
             task = asyncio.create_task(bot.on_finish(msg))
             await asyncio.sleep(0.05)
-            finish_session.assert_not_called()
+            begin_review.assert_not_called()
 
             lock.release()
             await asyncio.wait_for(task, timeout=1)
 
-        finish_session.assert_awaited_once_with(sess["id"])
+        begin_review.assert_awaited_once_with(sess["id"])
+        show_review.assert_awaited_once_with(msg, sess["id"])
         self.assertIn(sess["id"], bot._locks)
-        self.assertTrue(any("Сессия завершена" in c.args[0] for c in msg.answer.await_args_list))
+        self.assertTrue(any("Интервью завершено" in c.args[0] for c in msg.answer.await_args_list))
 
     async def test_stale_expert_turn_after_finish_or_reset_does_not_write_or_run_llm(self) -> None:
         msg = _FakeMsg()

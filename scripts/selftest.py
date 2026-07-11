@@ -144,8 +144,12 @@ async def run(topic: str, persona_key: str, turns: int, postprocess: bool) -> No
     print(f"итог: токенов={total}, сообщений={n_msgs}")
 
     if postprocess:
+        session = await db.get_session(sid)
+        if session["status"] == "draft_review":
+            await db.approve_review(sid, session["user_id"], None)
+            session = await db.get_session(sid)
         n = await extract.run(sid)
-        await summary.run(topic)
+        await summary.run(session["workspace_id"], session["topic_id"])
         scored = await evaljob.run(sid)
         p = await db.pool()
         audit = await p.fetchrow(

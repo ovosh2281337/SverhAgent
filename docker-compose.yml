@@ -9,7 +9,7 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d:ro
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U kb -d kb"]
       interval: 3s
@@ -27,6 +27,13 @@ services:
     # "db", not "localhost". .env keeps localhost so a locally-run bot works too.
     environment:
       DATABASE_URL: postgresql://kb:kb@db:5432/kb
+      # Local .env URLs use localhost for a host-run bot. Container must reach
+      # those same services through Docker's host gateway.
+      OPENAI_BASE_URL: ${DOCKER_OPENAI_BASE_URL:-http://host.docker.internal:20128/v1}
+      EMBED_MODE: ${DOCKER_EMBED_MODE:-external}
+      EMBED_BASE_URL: ${DOCKER_EMBED_BASE_URL:-http://host.docker.internal:8300/v1}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       db:
         condition: service_healthy

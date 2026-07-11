@@ -314,7 +314,15 @@ def check_app_config(root: Path, docker: bool = False) -> dict[str, Any]:
             "TELEGRAM_BOT_TOKEN still has the template placeholder value"
         )
     _required(env, "DATABASE_URL")
-    _ensure_openai_v1_url("OPENAI_BASE_URL", env.get("OPENAI_BASE_URL", ""))
+    openai_base_url = env.get("OPENAI_BASE_URL", "")
+    _ensure_openai_v1_url("OPENAI_BASE_URL", openai_base_url)
+    if docker and _is_loopback_host(urlparse(openai_base_url).hostname):
+        raise PreflightError(
+            "docker-compose cannot use a loopback OPENAI_BASE_URL because "
+            "localhost points at the bot container. Use "
+            "OPENAI_BASE_URL=http://host.docker.internal:20128/v1 or a "
+            "network-reachable OpenAI-compatible endpoint."
+        )
     for name in ("DIALOG_MODEL", "EXTRACT_MODEL", "SUMMARY_MODEL", "EVAL_MODEL"):
         _required(env, name)
 

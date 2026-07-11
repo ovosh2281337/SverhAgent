@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from src import config
 from src.jobs import extract
 
 
@@ -68,6 +69,17 @@ def _contextual_candidate():
 
 
 class GroundingPipelineTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._session_patch = patch.object(
+            extract.db,
+            "get_session",
+            AsyncMock(return_value={"workspace_id": 11, "topic_id": 22}),
+        )
+        self._session_patch.start()
+
+    def tearDown(self) -> None:
+        self._session_patch.stop()
+
     async def test_verified_item_is_embedded_and_saved_with_provenance(self) -> None:
         seen: set[str] = set()
         with (
@@ -76,7 +88,7 @@ class GroundingPipelineTests(unittest.IsolatedAsyncioTestCase):
                 extract.embed, "embed", AsyncMock(return_value=[0.0, 0.1])
             ) as embed_mock,
             patch.object(
-                extract.db, "nearest_canonical", AsyncMock(return_value=None)
+                extract.db, "nearest_canonicals", AsyncMock(return_value=[])
             ),
             patch.object(
                 extract.db, "add_extracted_item", AsyncMock(return_value=123)
@@ -137,6 +149,65 @@ class GroundingPipelineTests(unittest.IsolatedAsyncioTestCase):
         repair_mock.assert_awaited_once()
         reject_mock.assert_not_awaited()
         self.assertEqual(add_mock.await_args.kwargs["grounding_status"], "partial")
+
+    async def test_exact_payload_candidate_is_persisted_as_verified_duplicate(self):
+        candidate = _direct_candidate()
+        validated, error = extract._validate_item(candidate, _messages())
+        self.assertIsNone(error)
+        self.assertIsNotNone(validated)
+        near = {
+            "id": 88,
+            "payload": candidate["payload"],
+            "quote": "old",
+            "support_mode": "direct_assertion",
+            "dist": 0.0,
+        }
+        with (
+            patch.object(extract.embed, "enabled", return_value=True),
+            patch.object(
+                extract.embed, "embed", AsyncMock(return_value=[0.0, 0.1])
+            ),
+            patch.object(
+                extract.db, "nearest_canonicals", AsyncMock(return_value=[near])
+            ),
+            patch.object(
+                extract.db, "add_extracted_item", AsyncMock(return_value=123)
+            ) as add_mock,
+            patch.object(extract.llm, "verify_memory_relation", AsyncMock()) as verify,
+        ):
+            await extract._insert_verified(10, "topic", validated, _VERIFIED, None)
+
+        verify.assert_not_awaited()
+        kwargs = add_mock.await_args.kwargs
+        self.assertEqual(kwargs["duplicate_of"], 88)
+        relation = kwargs["grounding_details"]["memory_relation"]
+        self.assertEqual(relation["relation"], "duplicate_of")
+        self.assertTrue(relation["verified"])
+
+    async def test_near_identical_candidate_uses_deterministic_duplicate_cutoff(self):
+        candidate = _direct_candidate()
+        validated, error = extract._validate_item(candidate, _messages())
+        self.assertIsNone(error)
+        near = {
+            "id": 89,
+            "payload": {"statement": "same fact, extractor wording drift"},
+            "quote": "old",
+            "support_mode": "direct_assertion",
+            "dist": config.DEDUP_SAME / 2,
+        }
+        with (
+            patch.object(extract.embed, "enabled", return_value=True),
+            patch.object(extract.embed, "embed", AsyncMock(return_value=[0.0, 0.1])),
+            patch.object(extract.db, "nearest_canonicals", AsyncMock(return_value=[near])),
+            patch.object(extract.db, "add_extracted_item", AsyncMock(return_value=123)) as add_mock,
+            patch.object(extract.llm, "classify_memory_relation", AsyncMock()) as classify,
+            patch.object(extract.llm, "verify_memory_relation", AsyncMock()) as verify,
+        ):
+            await extract._insert_verified(10, "topic", validated, _VERIFIED, None)
+
+        classify.assert_not_awaited()
+        verify.assert_not_awaited()
+        self.assertEqual(add_mock.await_args.kwargs["duplicate_of"], 89)
 
     async def test_invalid_candidate_can_be_repaired_once(self) -> None:
         invalid = {

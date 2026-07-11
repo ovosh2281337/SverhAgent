@@ -25,6 +25,28 @@ _RETRIES = 3
 _RETRY_SLEEP = 1.5
 
 
+class DialogueContextExceeded(RuntimeError):
+    """Raised before a completion whose prompt cannot fit model context."""
+
+    def __init__(self, spent: int = 0):
+        super().__init__("dialogue prompt exceeds model context before LLM request")
+        self.spent = spent
+
+
+def estimate_tokens(value: Any) -> int:
+    """Conservative tokenizer-free estimate suitable for mixed Russian/JSON."""
+    if not isinstance(value, str):
+        value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return max(1, (len(value) + 1) // 2)
+
+
+def estimate_request_tokens(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+) -> int:
+    # Per-message framing/tool schema overhead matters for many short turns.
+    return 64 + estimate_tokens(messages) + (estimate_tokens(tools) if tools else 0)
+
+
 async def _complete(model: str, messages: list[dict], extra: dict) -> Any:
     """One streamed completion with retries on transient upstream/network errors."""
     last: Exception | None = None
@@ -85,14 +107,23 @@ async def dialogue(
         # On the final allowed round, drop tools so the model must answer in
         # prose — a guard against a model that loops tool calls forever.
         use_tools = round_ < MAX_TOOL_ROUNDS
-        extra = {"tools": tools, "tool_choice": "auto"} if use_tools else {}
+        active_tools = tools if use_tools else []
+        prompt_tokens = estimate_request_tokens(messages, active_tools)
+        if prompt_tokens >= config.DIALOG_CONTEXT_TOKENS:
+            raise DialogueContextExceeded(tokens)
+        extra = {}
+        if use_tools:
+            extra.update({"tools": tools, "tool_choice": "auto"})
         resp = await _complete(config.DIALOG_MODEL, messages, extra)
-        tokens += _usage(resp)
         msg = resp.choices[0].message
+        charged = _usage(resp) or (
+            prompt_tokens + estimate_tokens(msg.content or "")
+        )
+        tokens += charged
         if rounds_out is not None:
             rounds_out.append({
                 "n": round_ + 1,
-                "tokens": _usage(resp),
+                "tokens": charged,
                 "tools": [tc.function.name for tc in (msg.tool_calls or [])],
                 "final": not msg.tool_calls,
             })
@@ -263,9 +294,112 @@ async def contradiction(a: str, b: str) -> bool:
         return False
 
 
+async def classify_memory_relation(
+    statement: str, candidates: list[dict]
+) -> dict:
+    from . import prompts
+    user = json.dumps(
+        {"statement": statement, "candidates": candidates},
+        ensure_ascii=False,
+    )
+    try:
+        data = await _json_call(
+            config.EVAL_MODEL, prompts.MEMORY_RELATION_SYSTEM, user
+        )
+    except (json.JSONDecodeError, APIError):
+        return {"relation": "new", "target_item_id": None,
+                "confidence": 0.0, "reason": "classifier failure"}
+    allowed = {
+        "duplicate_of", "supports", "contradicts", "refines", "depends_on", "new"
+    }
+    if not isinstance(data, dict) or data.get("relation") not in allowed:
+        return {"relation": "new", "target_item_id": None,
+                "confidence": 0.0, "reason": "invalid classifier output"}
+    candidate_ids = {candidate["item_id"] for candidate in candidates}
+    target = data.get("target_item_id")
+    if data["relation"] != "new" and target not in candidate_ids:
+        return {"relation": "new", "target_item_id": None,
+                "confidence": 0.0, "reason": "target outside candidates"}
+    try:
+        confidence = max(0.0, min(1.0, float(data.get("confidence", 0))))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return {
+        "relation": data["relation"],
+        "target_item_id": target if data["relation"] != "new" else None,
+        "confidence": confidence,
+        "reason": str(data.get("reason") or "").strip(),
+    }
+
+
+async def verify_memory_relation(
+    relation: str, source_statement: str, target_statement: str
+) -> dict:
+    from . import prompts
+    user = json.dumps(
+        {"relation": relation, "source": source_statement, "target": target_statement},
+        ensure_ascii=False,
+    )
+    try:
+        data = await _json_call(
+            config.GROUND_MODEL, prompts.MEMORY_RELATION_VERIFY_SYSTEM, user
+        )
+    except (json.JSONDecodeError, APIError):
+        return {"verified": False, "reason": "verifier failure"}
+    if not isinstance(data, dict) or not isinstance(data.get("verified"), bool):
+        return {"verified": False, "reason": "invalid verifier output"}
+    return {"verified": data["verified"],
+            "reason": str(data.get("reason") or "").strip()}
+
+
+async def extract_memory_entities(statements: list[str]) -> list[list[str]]:
+    from . import prompts
+    data = await _json_call(
+        config.EXTRACT_MODEL,
+        prompts.MEMORY_ENTITIES_SYSTEM,
+        json.dumps(statements, ensure_ascii=False),
+    )
+    if not isinstance(data, list) or len(data) != len(statements):
+        raise ValueError("entity extractor returned wrong batch shape")
+    result: list[list[str]] = []
+    for values in data:
+        if not isinstance(values, list):
+            raise ValueError("entity extractor item is not an array")
+        result.append([
+            value.strip() for value in values if isinstance(value, str) and value.strip()
+        ][:12])
+    return result
+
+
+async def hierarchical_memory_summary(items: list[dict]) -> str:
+    from . import prompts
+    return (
+        await _content(
+            config.SUMMARY_MODEL,
+            prompts.HIERARCHICAL_SUMMARY_SYSTEM,
+            json.dumps(items, ensure_ascii=False),
+        )
+    ).strip()
+
+
 async def summary(user: str) -> str:
     from . import prompts
     return (await _content(config.SUMMARY_MODEL, prompts.SUMMARY_SYSTEM, user)).strip()
+
+
+async def compact_history(previous_summary: str, turns: list[dict]) -> str:
+    from . import prompts
+    user = json.dumps(
+        {"previous_summary": previous_summary, "new_old_turns": turns},
+        ensure_ascii=False,
+    )
+    return (
+        await _content(
+            config.SUMMARY_MODEL,
+            prompts.CONTEXT_COMPACTION_SYSTEM,
+            user,
+        )
+    ).strip()
 
 
 async def eval_question(user: str) -> Optional[dict]:

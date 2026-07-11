@@ -431,38 +431,96 @@ async def _insert_verified(
     verdict: dict,
     trace: list[str] | None,
 ) -> None:
+    session = await db.get_session(session_id)
+    if session is None:
+        raise ValueError(f"session not found: {session_id}")
     vector = await embed.embed(
         _embed_text(item.payload, item.support_quotes), required=embed.enabled()
     )
     duplicate_of = None
     decision = "новое"
     payload = item.payload
+    grounding_details = dict(verdict)
     if vector is not None:
-        near = await db.nearest_canonical(topic, vector, session_id)
-        if near is not None:
-            distance = float(near["dist"])
-            if distance <= config.DEDUP_SAME:
-                duplicate_of = near["id"]
-                decision = f"дубль → #{near['id']} (dist={distance:.2f})"
-            elif distance <= config.DEDUP_NEAR:
-                near_payload = near["payload"]
-                if isinstance(near_payload, str):
-                    near_payload = json.loads(near_payload)
-                conflict = await llm.contradiction(
-                    _embed_text(near_payload, ""),
-                    _embed_text(payload, item.support_quotes),
+        nearby = await db.nearest_canonicals(
+            session["workspace_id"], session["topic_id"], vector, session_id,
+            limit=10,
+        )
+        candidates = []
+        candidate_statements: dict[int, str] = {}
+        candidate_payloads: dict[int, str] = {}
+        for near in nearby[:5]:
+            near_payload = near["payload"]
+            if isinstance(near_payload, str):
+                near_payload = json.loads(near_payload)
+            text = _embed_text(near_payload, "")
+            candidate_statements[near["id"]] = text
+            candidate_payloads[near["id"]] = json.dumps(
+                near_payload, ensure_ascii=False, sort_keys=True
+            )
+            candidates.append({
+                "item_id": near["id"],
+                "statement": text,
+                "distance": round(float(near["dist"]), 6),
+            })
+        if candidates:
+            source_text = _embed_text(payload, item.support_quotes)
+            # Cosine distance below DEDUP_SAME is our deterministic duplicate
+            # fast path.  The old JSON-only check let harmless extractor
+            # wording drift reach the probabilistic classifier, so identical
+            # evidence could intermittently become a new canonical claim.
+            semantic_target = next(
+                (
+                    near["id"] for near in nearby[:5]
+                    if float(near["dist"]) <= config.DEDUP_SAME
+                ),
+                None,
+            )
+            exact_target = next(
+                (
+                    item_id for item_id, candidate_payload in candidate_payloads.items()
+                    if candidate_payload
+                    == json.dumps(payload, ensure_ascii=False, sort_keys=True)
+                ),
+                None,
+            )
+            relation = (
+                {
+                    "relation": "duplicate_of",
+                    "target_item_id": exact_target or semantic_target,
+                    "confidence": 1.0,
+                    "reason": (
+                        "exact normalized payload match"
+                        if exact_target is not None
+                        else f"cosine distance <= DEDUP_SAME ({config.DEDUP_SAME})"
+                    ),
+                    "verified": True,
+                }
+                if exact_target is not None or semantic_target is not None
+                else await llm.classify_memory_relation(source_text, candidates)
+            )
+            target_id = relation.get("target_item_id")
+            if (
+                relation["relation"] != "new"
+                and target_id in candidate_statements
+                and "verified" not in relation
+            ):
+                verified = await llm.verify_memory_relation(
+                    relation["relation"], source_text,
+                    candidate_statements[target_id],
                 )
-                if conflict:
-                    payload = {**payload, "contradicts": near["id"]}
-                    decision = (
-                        f"⚠ противоречие с #{near['id']} "
-                        f"(dist={distance:.2f}, судья ЛЛМ)"
-                    )
-                else:
-                    decision = (
-                        f"новое (рядом #{near['id']} dist={distance:.2f}, "
-                        "но судья: не противоречие)"
-                    )
+                relation = {**relation, **verified}
+            if relation["relation"] != "new" and target_id in candidate_statements:
+                grounding_details["memory_relation"] = relation
+                if (
+                    relation["relation"] == "duplicate_of"
+                    and relation.get("verified") is True
+                ):
+                    duplicate_of = target_id
+                decision = (
+                    f"{relation['relation']} → #{target_id}; "
+                    f"verified={relation.get('verified', False)}"
+                )
     await db.add_extracted_item(
         session_id=session_id,
         type_=item.type,
@@ -472,7 +530,7 @@ async def _insert_verified(
         provenance=item.provenance,
         support_mode=item.support_mode,
         grounding_status="verified",
-        grounding_details=verdict,
+        grounding_details=grounding_details,
         embedding=vector,
         duplicate_of=duplicate_of,
     )
@@ -645,7 +703,7 @@ async def run(
         fallback_status = "extracted"
     else:
         claimed = await db.claim_for_extraction(session_id)
-        fallback_status = "finished"
+        fallback_status = "finalized"
     if not claimed:
         return 0
     try:

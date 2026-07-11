@@ -150,6 +150,24 @@ class PreflightEnvTests(unittest.TestCase):
                 with self.assertRaises(preflight.PreflightError):
                     preflight.check_app_config(root, docker=True)
 
+    def test_docker_rejects_loopback_openai_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".env").write_text(
+                "\n".join([
+                    "TELEGRAM_BOT_TOKEN=123456:valid-looking-token",
+                    "DATABASE_URL=postgresql://kb:kb@db:5432/kb",
+                    "OPENAI_BASE_URL=http://localhost:20128/v1",
+                    "DIALOG_MODEL=chat", "EXTRACT_MODEL=chat",
+                    "SUMMARY_MODEL=chat", "EVAL_MODEL=chat", "GROUND_MODEL=chat",
+                    "EMBED_MODE=disabled",
+                ]),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(preflight.PreflightError, "OPENAI_BASE_URL"):
+                    preflight.check_app_config(root, docker=True)
+
 
 if __name__ == "__main__":
     unittest.main()

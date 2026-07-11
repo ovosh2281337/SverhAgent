@@ -1,5 +1,7 @@
 # SverhAgent
 
+[Архитектура долговечной памяти и Hybrid RAG](docs/MEMORY.md)
+
 Telegram-агент для сбора экспертных знаний. Он ведет интервью, сохраняет сырой
 транскрипт, вытаскивает из него проверяемые факты и использует накопленную
 память в следующих интервью по той же теме.
@@ -45,7 +47,6 @@ flowchart TD
     I1 --> A
 
     H5 --> J["сессия становится finished"]
-    G -->|лимит HARD_CAP_TOKENS| J
     A -->|/finish| J
     J --> K["фоновая обработка<br/>после интервью"]
     K --> L["извлечение фактов<br/>src.jobs.extract"]
@@ -60,7 +61,8 @@ flowchart TD
 1. Эксперт присылает текст или голосовое сообщение.
 2. Бот сохраняет сообщение в `messages`.
 3. `src.state` собирает компактный `STATE`: план, прогресс, краткую сводку
-   прошлых сессий, релевантные факты из базы и бюджет токенов.
+   прошлых сессий и релевантные факты из базы. Длинная текущая история
+   автоматически сжимается по размеру context window.
 4. `src.llm` вызывает чат-модель через OpenAI-compatible `/v1` endpoint.
 5. Модель может вызвать инструменты:
    - `update_plan` — заменить план интервью;
@@ -69,7 +71,6 @@ flowchart TD
    - `web_search` / `web_fetch` — проверить внешний факт через Tavily;
    - `end_session` — закончить интервью с финальным резюме.
 6. Ответ агента и список tool calls сохраняются в БД.
-7. Если достигнут `HARD_CAP_TOKENS`, сессия закрывается принудительно.
 
 ### Что попадает в память
 
@@ -247,8 +248,7 @@ docker compose down -v   # удаляет том Postgres и всю локаль
 | `EVAL_MODEL` | нет | модель оценки вопросов агента |
 | `GROUND_MODEL` | нет | semantic judge для grounded extraction |
 | `DATABASE_URL` | нет | Postgres DSN, по умолчанию `localhost:5432/kb` |
-| `SOFT_CAP_TOKENS` | нет | мягкий лимит: агент просит себя закругляться |
-| `HARD_CAP_TOKENS` | нет | жесткий лимит: сессия закрывается |
+| `DIALOG_CONTEXT_TOKENS` | нет | физический context window модели; не ограничивает длину интервью |
 | `TAVILY_API_KEY` | нет | включает `web_search` и `web_fetch` |
 | `STT_BASE_URL` | нет | включает обработку Telegram voice через локальный STT service |
 
@@ -446,15 +446,15 @@ python -m scripts.preflight health --url http://127.0.0.1:8300/health
 python -m src.db migrate
 python -m src.jobs.extract <session_id>
 python -m src.jobs.extract <session_id> --reground
-python -m src.jobs.summary <topic>
+python -m src.jobs.summary <workspace_id> <topic_id>
 python -m src.jobs.eval <session_id>
 python -m scripts.reground_legacy --dry-run
 python -m scripts.reground_legacy --topic default --verbose
 python -m scripts.reground_legacy --limit 3 --no-summary
-python -m scripts.view <topic>
+python -m scripts.view <workspace_id> <topic_id>
 python -m scripts.stats
-python -m scripts.export <topic>
-python -m scripts.export <topic> <outfile>
+python -m scripts.export <workspace_id> <topic_id>
+python -m scripts.export <workspace_id> <topic_id> <outfile>
 python -m scripts.backfill_embeddings
 python -m scripts.backfill_embeddings --stale
 python -m scripts.backfill_embeddings --all
@@ -536,3 +536,27 @@ tests/              unit- и integration-style тесты без живого Te
 - Пользовательский RAG/LoRA слой поверх собранной базы не реализован.
 - GraphRAG намеренно не добавлен: на масштабе десятков или сотен записей
   типизированные записи + pgvector + связи `duplicate_of`/`contradicts` проще и надежнее.
+
+## Multi-user security и публикация
+
+- Каждый Telegram user получает personal workspace; одинаковые названия тем в
+  разных workspaces не пересекаются.
+- RAG, dedup, summary, view и export требуют `workspace_id + topic_id`.
+- Group chats отключены. `/verbose` разрешён только ролям `owner`/`admin`.
+- `/finish` переводит интервью в `draft_review`, но ничего не публикует.
+  Команды проверки: `/review`, `/edit N текст`, `/delete N`, `/add текст`.
+- `/approve` фиксирует проверенную версию и атомарно создаёт durable job.
+  Worker использует lease/heartbeat, retry/backoff, idempotency key и PostgreSQL
+  advisory lock на тему. Dedup + summary одной темы не выполняются параллельно.
+- PostgreSQL из Compose доступен на host только через `127.0.0.1:5432`.
+
+Tenant-scoped inspection/export:
+
+```bash
+python -m scripts.view <workspace_id> <topic_id>
+python -m scripts.export <workspace_id> <topic_id> [outfile]
+python -m src.jobs.summary <workspace_id> <topic_id>
+```
+
+Worker config: `JOB_LEASE_SECONDS`, `JOB_HEARTBEAT_SECONDS`,
+`JOB_POLL_SECONDS`. Heartbeat обязан быть короче lease.

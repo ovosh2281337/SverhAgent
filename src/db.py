@@ -1,6 +1,7 @@
 """Thin asyncpg wrapper. One pool for the process."""
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -93,13 +94,129 @@ async def vector_health_check() -> None:
 
 # --- sessions ---------------------------------------------------------------
 
+async def ensure_user_workspace(
+    telegram_user_id: int,
+    telegram_username: Optional[str] = None,
+    telegram_full_name: Optional[str] = None,
+) -> asyncpg.Record:
+    """Resolve Telegram identity to public collection or private workspace."""
+    if telegram_user_id <= 0:
+        raise ValueError("telegram_user_id must be positive")
+    p = await pool()
+    async with p.acquire() as conn, conn.transaction():
+        user = await conn.fetchrow(
+            "INSERT INTO users (telegram_user_id,telegram_username,telegram_full_name) "
+            "VALUES ($1,$2,$3) ON CONFLICT (telegram_user_id) DO UPDATE SET "
+            "telegram_username=COALESCE(EXCLUDED.telegram_username,users.telegram_username), "
+            "telegram_full_name=COALESCE(EXCLUDED.telegram_full_name,users.telegram_full_name), "
+            "updated_at=now() RETURNING *",
+            telegram_user_id, telegram_username, telegram_full_name,
+        )
+        public = bool(config.PUBLIC_COLLECTION_SLUG)
+        if public:
+            workspace = await conn.fetchrow(
+                "INSERT INTO workspaces(owner_user_id,name,slug) VALUES (NULL,$1,$2) "
+                "ON CONFLICT (slug) DO UPDATE SET name=EXCLUDED.name RETURNING *",
+                config.PUBLIC_COLLECTION_NAME, config.PUBLIC_COLLECTION_SLUG,
+            )
+            role = (
+                "admin" if telegram_user_id in config.ADMIN_TELEGRAM_USER_IDS
+                else "member"
+            )
+        else:
+            workspace = await conn.fetchrow(
+                "INSERT INTO workspaces(owner_user_id,name,slug) VALUES ($1,$2,$3) "
+                "ON CONFLICT (owner_user_id) DO UPDATE SET name=EXCLUDED.name RETURNING *",
+                user["id"],
+                telegram_full_name or telegram_username or "Personal workspace",
+                f"personal-{user['id']}",
+            )
+            role = "owner"
+        await conn.execute(
+            "INSERT INTO workspace_members(workspace_id,user_id,role) "
+            "VALUES ($1,$2,$3) ON CONFLICT (workspace_id,user_id) "
+            "DO UPDATE SET role=EXCLUDED.role",
+            workspace["id"], user["id"], role,
+        )
+        return await conn.fetchrow(
+            "SELECT $1::bigint AS user_id,$2::bigint AS workspace_id,$3::text AS role",
+            user["id"], workspace["id"], role,
+        )
+
+
+async def ensure_legacy_workspace() -> asyncpg.Record:
+    p = await pool()
+    async with p.acquire() as conn, conn.transaction():
+        user = await conn.fetchrow(
+            "INSERT INTO users(telegram_full_name) VALUES ('CLI/legacy session') "
+            "RETURNING *"
+        )
+        workspace = await conn.fetchrow(
+            "INSERT INTO workspaces(owner_user_id,name,slug) "
+            "VALUES ($1,'Legacy workspace',$2) ON CONFLICT (owner_user_id) "
+            "DO UPDATE SET name=EXCLUDED.name RETURNING *",
+            user["id"], f"personal-{user['id']}",
+        )
+        await conn.execute(
+            "INSERT INTO workspace_members(workspace_id,user_id,role) "
+            "VALUES ($1,$2,'owner') ON CONFLICT DO NOTHING",
+            workspace["id"], user["id"],
+        )
+        return await conn.fetchrow(
+            "SELECT $1::bigint AS user_id,$2::bigint AS workspace_id,'owner'::text AS role",
+            user["id"], workspace["id"],
+        )
+
+
+async def resolve_topic(workspace_id: int, name: str) -> asyncpg.Record:
+    clean = " ".join(name.strip().split())[:200] or "default"
+    p = await pool()
+    return await p.fetchrow(
+        "INSERT INTO topics(workspace_id,name) VALUES ($1,$2) "
+        "ON CONFLICT (workspace_id,name) DO UPDATE SET name=EXCLUDED.name RETURNING *",
+        workspace_id, clean,
+    )
+
+
+async def get_topic(workspace_id: int, topic_id: int) -> Optional[asyncpg.Record]:
+    p = await pool()
+    return await p.fetchrow(
+        "SELECT * FROM topics WHERE workspace_id=$1 AND id=$2",
+        workspace_id, topic_id,
+    )
+
+
+async def workspace_access_for_user(
+    telegram_user_id: int, workspace_id: int
+) -> Optional[asyncpg.Record]:
+    p = await pool()
+    return await p.fetchrow(
+        "SELECT u.id AS user_id,wm.workspace_id,wm.role FROM users u "
+        "JOIN workspace_members wm ON wm.user_id=u.id "
+        "WHERE u.telegram_user_id=$1 AND wm.workspace_id=$2",
+        telegram_user_id, workspace_id,
+    )
+
 async def active_session_for_user(telegram_user_id: int) -> Optional[asyncpg.Record]:
     if telegram_user_id <= 0:
         raise ValueError("telegram_user_id must be positive")
     p = await pool()
     return await p.fetchrow(
-        "SELECT * FROM sessions WHERE telegram_user_id=$1 AND status='active' "
-        "ORDER BY id DESC LIMIT 1",
+        "SELECT s.* FROM sessions s JOIN users u ON u.id=s.user_id "
+        "WHERE u.telegram_user_id=$1 AND s.status='active' "
+        "ORDER BY s.id DESC LIMIT 1",
+        telegram_user_id,
+    )
+
+
+async def open_session_for_user(telegram_user_id: int) -> Optional[asyncpg.Record]:
+    if telegram_user_id <= 0:
+        raise ValueError("telegram_user_id must be positive")
+    p = await pool()
+    return await p.fetchrow(
+        "SELECT s.* FROM sessions s JOIN users u ON u.id=s.user_id "
+        "WHERE u.telegram_user_id=$1 AND s.status IN ('active','draft_review') "
+        "ORDER BY s.id DESC LIMIT 1",
         telegram_user_id,
     )
 
@@ -116,18 +233,32 @@ async def create_session(
     telegram_user_id: Optional[int] = None,
     telegram_username: Optional[str] = None,
     telegram_full_name: Optional[str] = None,
+    user_id: Optional[int] = None,
+    workspace_id: Optional[int] = None,
+    topic_id: Optional[int] = None,
 ) -> asyncpg.Record:
     if telegram_user_id is not None and telegram_user_id <= 0:
         raise ValueError("telegram_user_id must be positive")
+    if user_id is None or workspace_id is None:
+        access = (
+            await ensure_user_workspace(
+                telegram_user_id, telegram_username, telegram_full_name
+            ) if telegram_user_id is not None else await ensure_legacy_workspace()
+        )
+        user_id, workspace_id = access["user_id"], access["workspace_id"]
+    if topic_id is None:
+        topic_row = await resolve_topic(workspace_id, topic)
+        topic_id, topic = topic_row["id"], topic_row["name"]
     p = await pool()
     try:
         return await p.fetchrow(
             "INSERT INTO sessions "
             "(expert_name, topic, prompt_version, telegram_user_id, "
-            " telegram_username, telegram_full_name) "
-            "VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
+            " telegram_username, telegram_full_name,user_id,workspace_id,topic_id) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *",
             expert_name, topic, config.PROMPT_VERSION,
             telegram_user_id, telegram_username, telegram_full_name,
+            user_id, workspace_id, topic_id,
         )
     except asyncpg.UniqueViolationError as exc:
         if telegram_user_id is not None:
@@ -154,12 +285,109 @@ async def delete_session(session_id: int) -> None:
 
 
 async def finish_session(session_id: int) -> None:
+    await begin_review(session_id)
+
+
+async def begin_review(session_id: int) -> bool:
+    """active -> draft_review; seed editable expert points."""
     p = await pool()
-    await p.execute(
-        "UPDATE sessions SET status='finished', finished_at=now() "
-        "WHERE id=$1 AND status='active'",
+    async with p.acquire() as conn, conn.transaction():
+        row = await conn.fetchrow(
+            "UPDATE sessions SET status='draft_review',finished_at=now() "
+            "WHERE id=$1 AND status='active' RETURNING id", session_id,
+        )
+        if row is None:
+            return False
+        await conn.execute(
+            "UPDATE messages SET included_in_extraction=FALSE "
+            "WHERE session_id=$1 AND role='user'", session_id,
+        )
+        await conn.execute(
+            "INSERT INTO review_items(session_id,source_message_id,ord,text) "
+            "SELECT $1,id,row_number() OVER (ORDER BY id)::int,content "
+            "FROM messages WHERE session_id=$1 AND role='user' "
+            "ON CONFLICT (session_id,ord) DO NOTHING", session_id,
+        )
+        return True
+
+
+async def review_items(session_id: int) -> list[asyncpg.Record]:
+    p = await pool()
+    return await p.fetch(
+        "SELECT id,ord,text,deleted FROM review_items WHERE session_id=$1 ORDER BY ord",
         session_id,
     )
+
+
+async def update_review_item(session_id: int, ord_: int, text: str) -> bool:
+    p = await pool()
+    row = await p.fetchrow(
+        "UPDATE review_items r SET text=$3,deleted=FALSE,updated_at=now() "
+        "FROM sessions s WHERE r.session_id=s.id AND s.id=$1 "
+        "AND s.status='draft_review' AND r.ord=$2 RETURNING r.id",
+        session_id, ord_, text.strip(),
+    )
+    return row is not None
+
+
+async def delete_review_item(session_id: int, ord_: int) -> bool:
+    p = await pool()
+    row = await p.fetchrow(
+        "UPDATE review_items r SET deleted=TRUE,updated_at=now() "
+        "FROM sessions s WHERE r.session_id=s.id AND s.id=$1 "
+        "AND s.status='draft_review' AND r.ord=$2 RETURNING r.id",
+        session_id, ord_,
+    )
+    return row is not None
+
+
+async def add_review_item(session_id: int, text: str) -> Optional[asyncpg.Record]:
+    p = await pool()
+    return await p.fetchrow(
+        "INSERT INTO review_items(session_id,ord,text) "
+        "SELECT s.id,COALESCE((SELECT max(ord)+1 FROM review_items "
+        "WHERE session_id=s.id),1),$2 FROM sessions s "
+        "WHERE s.id=$1 AND s.status='draft_review' RETURNING *",
+        session_id, text.strip(),
+    )
+
+
+async def approve_review(session_id: int, user_id: int, chat_id: Optional[int]) -> bool:
+    """Freeze reviewed points, finalize, enqueue exactly one durable job."""
+    p = await pool()
+    async with p.acquire() as conn, conn.transaction():
+        sess = await conn.fetchrow(
+            "SELECT * FROM sessions WHERE id=$1 AND user_id=$2 "
+            "AND status='draft_review' FOR UPDATE", session_id, user_id,
+        )
+        if sess is None:
+            return False
+        count = await conn.fetchval(
+            "SELECT count(*) FROM review_items WHERE session_id=$1 "
+            "AND NOT deleted AND btrim(text)<>''", session_id,
+        )
+        if not count:
+            return False
+        await conn.execute(
+            "INSERT INTO messages(session_id,role,content,tool_calls,included_in_extraction) "
+            "SELECT $1,'user',text,jsonb_build_object('review_item_id',id,'approved',true),TRUE "
+            "FROM review_items WHERE session_id=$1 AND NOT deleted "
+            "AND btrim(text)<>'' ORDER BY ord", session_id,
+        )
+        await conn.execute(
+            "UPDATE sessions SET status='finalized' WHERE id=$1", session_id,
+        )
+        await conn.execute(
+            "INSERT INTO postprocess_jobs "
+            "(workspace_id,session_id,topic_id,chat_id,extraction_version,"
+            "prompt_version,model_version,idempotency_key) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8) "
+            "ON CONFLICT (session_id) DO NOTHING",
+            sess["workspace_id"], session_id, sess["topic_id"], chat_id,
+            config.GROUNDING_VERSION, config.PROMPT_VERSION, config.EXTRACT_MODEL,
+            f"postprocess:{session_id}:{config.GROUNDING_VERSION}",
+        )
+        return True
 
 
 async def claim_for_extraction(session_id: int) -> bool:
@@ -168,7 +396,7 @@ async def claim_for_extraction(session_id: int) -> bool:
     p = await pool()
     row = await p.fetchrow(
         "UPDATE sessions SET status='extracting' "
-        "WHERE id=$1 AND status='finished' RETURNING id",
+        "WHERE id=$1 AND status='finalized' RETURNING id",
         session_id,
     )
     return row is not None
@@ -218,14 +446,14 @@ async def revert_extraction(session_id: int) -> None:
     """extracting -> finished, so a crashed extraction can be retried."""
     p = await pool()
     await p.execute(
-        "UPDATE sessions SET status='finished' "
+        "UPDATE sessions SET status='finalized' "
         "WHERE id=$1 AND status='extracting'",
         session_id,
     )
 
 
 async def restore_extraction_status(session_id: int, status: str) -> None:
-    if status not in {"finished", "extracted"}:
+    if status not in {"finalized", "extracted"}:
         raise ValueError(f"invalid extraction fallback status: {status}")
     p = await pool()
     await p.execute(
@@ -301,10 +529,91 @@ async def history(session_id: int) -> list[asyncpg.Record]:
     )
 
 
+async def context_compaction(session_id: int) -> Optional[asyncpg.Record]:
+    p = await pool()
+    return await p.fetchrow(
+        "SELECT summary,through_message_id,prompt_version,updated_at "
+        "FROM session_context_compactions WHERE session_id=$1",
+        session_id,
+    )
+
+
+async def uncompacted_history_size(session_id: int, after_id: int) -> asyncpg.Record:
+    p = await pool()
+    return await p.fetchrow(
+        "SELECT count(*)::bigint AS messages,"
+        "COALESCE(sum(length(content)+128),0)::bigint AS chars "
+        "FROM messages WHERE session_id=$1 AND id>$2 "
+        "AND role IN ('user','assistant')",
+        session_id, after_id,
+    )
+
+
+async def history_after(
+    session_id: int, after_id: int, limit: int
+) -> list[asyncpg.Record]:
+    p = await pool()
+    return await p.fetch(
+        "SELECT id,role,content FROM messages WHERE session_id=$1 AND id>$2 "
+        "AND role IN ('user','assistant') ORDER BY id LIMIT $3",
+        session_id, after_id, limit,
+    )
+
+
+async def history_after_all(
+    session_id: int, after_id: int
+) -> list[asyncpg.Record]:
+    p = await pool()
+    return await p.fetch(
+        "SELECT id,role,content FROM messages WHERE session_id=$1 AND id>$2 "
+        "AND role IN ('user','assistant') ORDER BY id",
+        session_id, after_id,
+    )
+
+
+async def recent_history_within_chars(
+    session_id: int, after_id: int, char_budget: int
+) -> list[asyncpg.Record]:
+    """Newest complete turns fitting a token-derived character budget."""
+    p = await pool()
+    return await p.fetch(
+        "WITH ranked AS (SELECT id,role,content,"
+        "row_number() OVER (ORDER BY id DESC) AS rn,"
+        "sum(length(content)+128) OVER (ORDER BY id DESC) AS running_chars "
+        "FROM messages WHERE session_id=$1 AND id>$2 "
+        "AND role IN ('user','assistant')) "
+        "SELECT id,role,content FROM ranked "
+        "WHERE running_chars<=$3 OR rn=1 ORDER BY id",
+        session_id, after_id, char_budget,
+    )
+
+
+async def upsert_context_compaction(
+    session_id: int, summary: str, through_message_id: int
+) -> None:
+    """Advance compaction cursor monotonically; stale writers cannot rewind it."""
+    p = await pool()
+    await p.execute(
+        "INSERT INTO session_context_compactions "
+        "(session_id,summary,through_message_id,prompt_version) VALUES ($1,$2,$3,$4) "
+        "ON CONFLICT (session_id) DO UPDATE SET "
+        "summary=EXCLUDED.summary,through_message_id=EXCLUDED.through_message_id,"
+        "prompt_version=EXCLUDED.prompt_version,updated_at=now() "
+        "WHERE session_context_compactions.through_message_id "
+        "< EXCLUDED.through_message_id",
+        session_id, summary.strip(), through_message_id, config.PROMPT_VERSION,
+    )
+
+
 async def transcript(session_id: int) -> list[asyncpg.Record]:
     p = await pool()
     return await p.fetch(
-        "SELECT id, role, content FROM messages WHERE session_id=$1 ORDER BY id",
+        "SELECT m.id,m.role,m.content FROM messages m "
+        "LEFT JOIN review_items r ON r.id=CASE "
+        "WHEN m.tool_calls ? 'review_item_id' "
+        "THEN (m.tool_calls->>'review_item_id')::bigint ELSE NULL END "
+        "WHERE m.session_id=$1 AND m.included_in_extraction "
+        "ORDER BY COALESCE(r.source_message_id,m.id),m.id",
         session_id,
     )
 
@@ -361,21 +670,25 @@ async def mark_covered(session_id: int, subtopic: str) -> None:
 
 # --- topic summary ----------------------------------------------------------
 
-async def topic_summary(topic: str) -> Optional[str]:
+async def topic_summary(workspace_id: int, topic_id: int) -> Optional[str]:
     p = await pool()
     return await p.fetchval(
-        "SELECT summary FROM topic_summaries WHERE topic=$1", topic
+        "SELECT summary FROM topic_summaries WHERE workspace_id=$1 AND topic_id=$2",
+        workspace_id, topic_id,
     )
 
 
-async def upsert_topic_summary(topic: str, summary: str) -> None:
+async def upsert_topic_summary(
+    workspace_id: int, topic_id: int, summary: str
+) -> None:
     p = await pool()
     await p.execute(
-        "INSERT INTO topic_summaries (topic, summary, prompt_version, generated_at) "
-        "VALUES ($1, $2, $3, now()) "
-        "ON CONFLICT (topic) DO UPDATE SET summary=EXCLUDED.summary, "
+        "INSERT INTO topic_summaries "
+        "(workspace_id,topic_id,summary,prompt_version,generated_at) "
+        "VALUES ($1,$2,$3,$4,now()) "
+        "ON CONFLICT (workspace_id,topic_id) DO UPDATE SET summary=EXCLUDED.summary, "
         "prompt_version=EXCLUDED.prompt_version, generated_at=now()",
-        topic, summary, config.PROMPT_VERSION,
+        workspace_id, topic_id, summary, config.PROMPT_VERSION,
     )
 
 
@@ -406,13 +719,13 @@ async def add_extracted_item(
         async with conn.transaction():
             item_id = await conn.fetchval(
                 "INSERT INTO extracted_items "
-                "(session_id, type, origin, payload, quote, source_message_id, "
+                "(session_id,workspace_id,topic_id,type,origin,payload,quote,source_message_id, "
                 " embedding, duplicate_of, prompt_version, embed_version, "
                 " support_mode, grounding_status, grounding_version, "
                 " grounding_details) "
-                "SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, "
-                "       $11, $12, $13, $14 "
-                "FROM messages m "
+                "SELECT $1,s.workspace_id,s.topic_id,$2,$3,$4,$5,$6,$7,$8,$9,$10, "
+                "       $11,$12,$13,$14 FROM messages m "
+                "JOIN sessions s ON s.id=$1 "
                 "WHERE m.id=$6 AND m.session_id=$1 AND m.role='user' "
                 "  AND substring(m.content FROM $15 + 1 FOR $16 - $15)=$5 "
                 "RETURNING id",
@@ -469,31 +782,45 @@ async def add_extraction_rejection(
 
 
 async def nearest_canonical(
-    topic: str, embedding: list[float], current_session: int
+    workspace_id: int, topic_id: int, embedding: list[float], current_session: int
 ) -> Optional[asyncpg.Record]:
     """Closest published fact, plus earlier rows of this extraction run.
 
     The current extracting session is included to collapse chunk-overlap
     duplicates. Rows from every other unfinished session stay invisible.
     """
+    rows = await nearest_canonicals(
+        workspace_id, topic_id, embedding, current_session, limit=1
+    )
+    return rows[0] if rows else None
+
+
+async def nearest_canonicals(
+    workspace_id: int, topic_id: int, embedding: list[float],
+    current_session: int, limit: int = 10,
+) -> list[asyncpg.Record]:
+    """Top-N tenant-local candidates for relation classification."""
     p = await pool()
-    return await p.fetchrow(
+    return await p.fetch(
         "SELECT e.id, e.payload, e.quote, e.support_mode, "
-        "       e.embedding <=> $2 AS dist "
+        "       e.embedding <=> $3 AS dist "
         "FROM extracted_items e JOIN sessions s ON s.id = e.session_id "
-        "WHERE s.topic=$1 AND (s.status='extracted' OR e.session_id=$5) "
+        "WHERE e.workspace_id=$1 AND e.topic_id=$2 "
+        "  AND (s.status='extracted' OR e.session_id=$6) "
         "  AND e.duplicate_of IS NULL AND e.embedding IS NOT NULL "
-        "  AND e.embed_version=$3 "
-        "  AND e.grounding_version=$4 "
+        "  AND e.embed_version=$4 "
+        "  AND e.grounding_version=$5 "
         "  AND e.grounding_status='verified' "
-        "ORDER BY dist LIMIT 1",
-        topic, embedding, config.EMBED_TEXT_VERSION, config.GROUNDING_VERSION,
-        current_session,
+        "  AND (e.embedding <=> $3) <= $7 "
+        "ORDER BY dist LIMIT $8",
+        workspace_id, topic_id, embedding, config.EMBED_TEXT_VERSION,
+        config.GROUNDING_VERSION,
+        current_session, config.RAG_MAX_DISTANCE, limit,
     )
 
 
 async def search_canonical(
-    topic: str, embedding: list[float], limit: int = 5,
+    workspace_id: int, topic_id: int, embedding: list[float], limit: int = 5,
     exclude_session: Optional[int] = None,
 ) -> list[asyncpg.Record]:
     """Top-k canonical facts of the topic nearest a query embedding (JIT context
@@ -501,20 +828,21 @@ async def search_canonical(
     drops the current session's own items so auto-RAG shows only OTHER experts."""
     p = await pool()
     return await p.fetch(
-        "SELECT e.type, e.payload, e.quote, e.origin, e.support_mode, "
+        "SELECT e.id,e.topic_id,e.type,e.payload,e.quote,e.origin,e.support_mode, "
         "       e.confirmation_count, "
-        "       s.expert_name, e.embedding <=> $2 AS dist "
+        "       s.expert_name,s.user_id,e.embedding <=> $3 AS dist "
         "FROM extracted_items e JOIN sessions s ON s.id = e.session_id "
-        "WHERE s.topic=$1 AND s.status='extracted' "
+        "WHERE e.workspace_id=$1 AND e.topic_id=$2 AND s.status='extracted' "
         "  AND e.duplicate_of IS NULL AND e.embedding IS NOT NULL "
-        "  AND e.embed_version=$5 "
-        "  AND e.grounding_version=$6 "
+        "  AND e.embed_version=$6 "
+        "  AND e.grounding_version=$7 "
         "  AND e.grounding_status='verified' "
-        "  AND ($4::bigint IS NULL OR e.session_id <> $4) "
-        "  AND (e.embedding <=> $2) <= $7 "
-        "ORDER BY dist LIMIT $3",
-        topic, embedding, limit, exclude_session, config.EMBED_TEXT_VERSION,
-        config.GROUNDING_VERSION, config.RAG_MAX_DISTANCE,
+        "  AND ($5::bigint IS NULL OR e.session_id <> $5) "
+        "  AND (e.embedding <=> $3) <= $8 "
+        "ORDER BY dist LIMIT $4",
+        workspace_id, topic_id, embedding, limit, exclude_session,
+        config.EMBED_TEXT_VERSION, config.GROUNDING_VERSION,
+        config.RAG_MAX_DISTANCE,
     )
 
 
@@ -543,7 +871,9 @@ async def extracted_count(session_id: int) -> int:
     )
 
 
-async def canonical_for_topic(topic: str) -> list[asyncpg.Record]:
+async def canonical_for_topic(
+    workspace_id: int, topic_id: int
+) -> list[asyncpg.Record]:
     """Only completed, current-version canonical items for topic summaries."""
     p = await pool()
     return await p.fetch(
@@ -566,24 +896,26 @@ async def canonical_for_topic(topic: str) -> list[asyncpg.Record]:
         "           JOIN messages m ON m.id=p.message_id "
         "           WHERE (ev.id=e.id OR ev.duplicate_of=e.id) "
         "             AND ev.grounding_status='verified' "
-        "             AND ev.grounding_version=$3 "
+        "             AND ev.workspace_id=$1 AND ev.topic_id=$2 "
+        "             AND ev.grounding_version=$4 "
         "             AND p.kind IN ('user_support','confirmation') "
         "           ORDER BY ev.id, p.ord "
         "           LIMIT 4 "
         "         ) x "
         "       ), '[]'::jsonb) AS supports "
         "FROM extracted_items e JOIN sessions s ON s.id = e.session_id "
-        "WHERE s.topic=$1 AND s.status='extracted' "
+        "WHERE e.workspace_id=$1 AND e.topic_id=$2 AND s.status='extracted' "
         "  AND e.duplicate_of IS NULL "
-        "  AND e.embed_version=$2 "
-        "  AND e.grounding_version=$3 "
+        "  AND e.embed_version=$3 "
+        "  AND e.grounding_version=$4 "
         "  AND e.grounding_status='verified' "
         "ORDER BY e.id",
-        topic, config.EMBED_TEXT_VERSION, config.GROUNDING_VERSION,
+        workspace_id, topic_id, config.EMBED_TEXT_VERSION,
+        config.GROUNDING_VERSION,
     )
 
 
-async def all_for_topic(topic: str) -> list[asyncpg.Record]:
+async def all_for_topic(workspace_id: int, topic_id: int) -> list[asyncpg.Record]:
     """Every item incl. duplicates — for inspection (scripts/view)."""
     p = await pool()
     return await p.fetch(
@@ -603,9 +935,94 @@ async def all_for_topic(topic: str) -> list[asyncpg.Record]:
         "         WHERE p.item_id=e.id "
         "       ), '[]'::jsonb) AS provenance "
         "FROM extracted_items e JOIN sessions s ON s.id = e.session_id "
-        "WHERE s.topic=$1 ORDER BY e.id",
-        topic,
+        "WHERE e.workspace_id=$1 AND e.topic_id=$2 ORDER BY e.id",
+        workspace_id, topic_id,
     )
+
+
+# --- durable post-processing ------------------------------------------------
+
+async def recover_stale_jobs() -> int:
+    p = await pool()
+    result = await p.execute(
+        "UPDATE postprocess_jobs SET status='retry_wait',worker_id=NULL,"
+        "lease_expires_at=NULL,available_at=now(),updated_at=now(),"
+        "last_error=COALESCE(last_error,'worker lease expired') "
+        "WHERE status='running' AND lease_expires_at < now()"
+    )
+    return int(result.rsplit(" ", 1)[-1])
+
+
+async def claim_postprocess_job(
+    worker_id: str, lease_seconds: int
+) -> Optional[asyncpg.Record]:
+    p = await pool()
+    return await p.fetchrow(
+        "WITH candidate AS (SELECT id FROM postprocess_jobs "
+        "WHERE status IN ('queued','retry_wait') AND available_at<=now() "
+        "ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1) "
+        "UPDATE postprocess_jobs j SET status='running',attempts=attempts+1,"
+        "worker_id=$1,started_at=COALESCE(started_at,now()),"
+        "lease_expires_at=now()+make_interval(secs=>$2),updated_at=now() "
+        "FROM candidate c WHERE j.id=c.id RETURNING j.*",
+        worker_id, lease_seconds,
+    )
+
+
+async def heartbeat_job(job_id: int, worker_id: str, lease_seconds: int) -> bool:
+    p = await pool()
+    row = await p.fetchrow(
+        "UPDATE postprocess_jobs SET lease_expires_at=now()+make_interval(secs=>$3),"
+        "updated_at=now() WHERE id=$1 AND worker_id=$2 AND status='running' RETURNING id",
+        job_id, worker_id, lease_seconds,
+    )
+    return row is not None
+
+
+async def succeed_job(job_id: int, worker_id: str) -> bool:
+    p = await pool()
+    row = await p.fetchrow(
+        "UPDATE postprocess_jobs SET status='succeeded',finished_at=now(),"
+        "lease_expires_at=NULL,worker_id=NULL,updated_at=now() "
+        "WHERE id=$1 AND worker_id=$2 AND status='running' RETURNING id",
+        job_id, worker_id,
+    )
+    return row is not None
+
+
+async def fail_job(job_id: int, worker_id: str, error: str) -> str:
+    p = await pool()
+    return await p.fetchval(
+        "UPDATE postprocess_jobs SET "
+        "status=CASE WHEN attempts>=max_attempts THEN 'dead' ELSE 'retry_wait' END,"
+        "available_at=CASE WHEN attempts>=max_attempts THEN available_at ELSE "
+        "now()+make_interval(secs=>LEAST(3600,15*power(2,attempts-1)::int)) END,"
+        "last_error=$3,lease_expires_at=NULL,worker_id=NULL,"
+        "finished_at=CASE WHEN attempts>=max_attempts THEN now() ELSE NULL END,"
+        "updated_at=now() WHERE id=$1 AND worker_id=$2 AND status='running' "
+        "RETURNING status", job_id, worker_id, error[:4000],
+    )
+
+
+async def release_job(job_id: int, worker_id: str) -> None:
+    p = await pool()
+    await p.execute(
+        "UPDATE postprocess_jobs SET status='retry_wait',available_at=now(),"
+        "lease_expires_at=NULL,worker_id=NULL,updated_at=now() "
+        "WHERE id=$1 AND worker_id=$2 AND status='running'", job_id, worker_id,
+    )
+
+
+@asynccontextmanager
+async def topic_advisory_lock(topic_id: int):
+    """Cross-process lock covering dedup and summary rebuild for one topic."""
+    p = await pool()
+    async with p.acquire() as conn:
+        await conn.execute("SELECT pg_advisory_lock($1::bigint)", topic_id)
+        try:
+            yield
+        finally:
+            await conn.execute("SELECT pg_advisory_unlock($1::bigint)", topic_id)
 
 
 # --- question evals ---------------------------------------------------------

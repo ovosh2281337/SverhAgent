@@ -20,8 +20,32 @@ def _float(name: str, default: float) -> float:
     return float(os.getenv(name, default))
 
 
+def _bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _int_set(name: str) -> frozenset[int]:
+    return frozenset(
+        int(value.strip())
+        for value in os.getenv(name, "").split(",")
+        if value.strip()
+    )
+
+
 TELEGRAM_BOT_TOKEN = _require("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = _require("DATABASE_URL")
+
+# Optional zero-onboarding collection. When set, every private Telegram user is
+# enrolled into this workspace; empty keeps isolated personal workspaces.
+PUBLIC_COLLECTION_SLUG = os.getenv("PUBLIC_COLLECTION_SLUG", "public").strip()
+PUBLIC_COLLECTION_NAME = (
+    os.getenv("PUBLIC_COLLECTION_NAME", "Public knowledge collection").strip()
+    or "Public knowledge collection"
+)
+ADMIN_TELEGRAM_USER_IDS = _int_set("ADMIN_TELEGRAM_USER_IDS")
 
 # --- Chat LLM: OpenAI-compatible endpoint (local server / gateway) -----------
 # Point OPENAI_BASE_URL at any OpenAI-compatible /v1 server (vLLM, llama.cpp,
@@ -41,10 +65,11 @@ EVAL_MODEL = os.getenv("EVAL_MODEL", "local-chat")
 # extractor that proposed the claim.
 GROUND_MODEL = os.getenv("GROUND_MODEL", EVAL_MODEL)
 
-# Session token budget (prompt+completion, accumulated in sessions.tokens_used).
-# Soft cap injects a "wrap up" nudge into STATE; hard cap forces end. 0 disables.
-SOFT_CAP_TOKENS = _int("SOFT_CAP_TOKENS", 120_000)
-HARD_CAP_TOKENS = _int("HARD_CAP_TOKENS", 200_000)
+# Physical context window. Dialogue length itself is unlimited: old turns are
+# compacted automatically when the next prompt approaches this window.
+DIALOG_CONTEXT_TOKENS = _int("DIALOG_CONTEXT_TOKENS", 32_768)
+if DIALOG_CONTEXT_TOKENS < 4_096:
+    raise RuntimeError("DIALOG_CONTEXT_TOKENS must be at least 4096")
 
 # --- Embeddings: harrier-oss-v1-270m via OpenAI-compatible endpoint -----------
 # EMBED_MODE separates "which endpoint should the app use" from "should the
@@ -100,6 +125,29 @@ DEDUP_NEAR = float(os.getenv("DEDUP_NEAR", "0.35"))
 # but weak nearest neighbours (for example dist~0.7) must not enter the prompt
 # as if they were facts relevant to the current turn.
 RAG_MAX_DISTANCE = _float("RAG_MAX_DISTANCE", 0.55)
+
+# Layered-memory retrieval. Shadow mode runs both paths but keeps flat vector
+# RAG user-visible until evaluation proves the hybrid path.
+HYBRID_RAG_ENABLED = _bool("HYBRID_RAG_ENABLED", False)
+HYBRID_RAG_SHADOW = _bool("HYBRID_RAG_SHADOW", True)
+HYBRID_VECTOR_LIMIT = _int("HYBRID_VECTOR_LIMIT", 20)
+HYBRID_FTS_LIMIT = _int("HYBRID_FTS_LIMIT", 20)
+HYBRID_RESULT_LIMIT = _int("HYBRID_RESULT_LIMIT", 8)
+HYBRID_RRF_K = _int("HYBRID_RRF_K", 60)
+RELATION_CLASSIFIER_VERSION = os.getenv("RELATION_CLASSIFIER_VERSION", "r1")
+RELATION_VERIFIER_VERSION = os.getenv("RELATION_VERIFIER_VERSION", "rv1")
+ENTITY_INDEX_ENABLED = _bool("ENTITY_INDEX_ENABLED", True)
+HIERARCHICAL_SUMMARIES_ENABLED = _bool("HIERARCHICAL_SUMMARIES_ENABLED", False)
+HIERARCHY_LEAF_SIZE = _int("HIERARCHY_LEAF_SIZE", 24)
+HIERARCHY_BRANCH_SIZE = _int("HIERARCHY_BRANCH_SIZE", 8)
+HIERARCHY_PROMPT_VERSION = os.getenv("HIERARCHY_PROMPT_VERSION", "hierarchy-v1")
+
+# Durable post-processing worker.
+JOB_LEASE_SECONDS = _int("JOB_LEASE_SECONDS", 180)
+JOB_HEARTBEAT_SECONDS = _int("JOB_HEARTBEAT_SECONDS", 30)
+JOB_POLL_SECONDS = _float("JOB_POLL_SECONDS", 2.0)
+if JOB_HEARTBEAT_SECONDS >= JOB_LEASE_SECONDS:
+    raise RuntimeError("JOB_HEARTBEAT_SECONDS must be less than JOB_LEASE_SECONDS")
 
 # --- Web search: Tavily (LLM-oriented search) --------------------------------
 # Lets the interviewer verify hardware/terms mid-reasoning before building a

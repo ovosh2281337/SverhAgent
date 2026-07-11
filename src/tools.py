@@ -11,7 +11,7 @@ import json
 import re
 from typing import Any
 
-from . import db, embed, websearch
+from . import config, db, embed, retrieval, websearch
 
 
 def _fn(name: str, description: str, properties: dict, required: list[str]) -> dict:
@@ -131,13 +131,18 @@ class SessionEnd(Exception):
         self.summary = summary
 
 
-async def _search_knowledge(topic: str, query: str) -> str:
-    if not embed.enabled():
+async def _search_knowledge(session_id: int, query: str) -> str:
+    if not embed.enabled() and not (
+        config.HYBRID_RAG_ENABLED or config.HYBRID_RAG_SHADOW
+    ):
         return "(поиск по базе недоступен: embeddings не настроены)"
-    vec = await embed.embed(query or "", query=True)
-    if vec is None:
-        return "(поиск по базе недоступен)"
-    rows = await db.search_canonical(topic, vec, limit=5)
+    session = await db.get_session(session_id)
+    if session is None:
+        return "(session not found)"
+    rows = await retrieval.retrieve_context(
+        session["workspace_id"], session["topic_id"], session["user_id"],
+        query or "", session_id=session_id, limit=5,
+    )
     if not rows:
         return "В базе по этой теме пока ничего похожего."
     out = []
@@ -149,10 +154,11 @@ async def _search_knowledge(topic: str, query: str) -> str:
         quote = (r["quote"] or "").strip()
         if len(quote) > 260:
             quote = quote[:260] + "…"
+        relation = f", связь={r.get('relation_type')}" if r.get("relation_type") else ""
         out.append(
             f"- [{r['type']}/{origin}, support={r['support_mode']}, "
             f"подтверждений={r['confirmation_count']}, "
-            f"эксперт={r['expert_name']}] "
+            f"эксперт={r['expert_name']}{relation}] "
             f"{json.dumps(payload, ensure_ascii=False)}"
             + (f" | expert_span: {quote}" if quote else "")
         )
@@ -176,7 +182,7 @@ async def apply(session_id: int, topic: str, name: str, args: dict) -> str:
         await db.mark_covered(session_id, args.get("subtopic", ""))
         return "ок, помечено"
     if name == "search_knowledge":
-        return await _search_knowledge(topic, args.get("query", ""))
+        return await _search_knowledge(session_id, args.get("query", ""))
     if name == "web_search":
         return await websearch.search(args.get("query", ""))
     if name == "web_fetch":

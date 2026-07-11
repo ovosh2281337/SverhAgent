@@ -8,7 +8,7 @@ can pull the rest just-in-time via search_knowledge.
 import json
 import re
 
-from . import config, db, embed
+from . import config, db, embed, retrieval
 
 # ~1000-token budget for the summary excerpt. Russian runs ~2 chars/token, so
 # ~2000 chars. Full summary in the DB can grow unbounded; this is only the
@@ -59,7 +59,9 @@ def _row_gist(r) -> str:
     mode = r["support_mode"] or "unknown"
     conf = r["confirmation_count"] or 1
     origin = "гипотеза" if r["origin"] == "confirmed_hypothesis" else "факт"
-    return f"{text} [origin={origin}; support={mode}; подтверждений={conf}]"
+    relation = r.get("relation_type") if isinstance(r, dict) else None
+    link = f"; связь={relation}" if relation else ""
+    return f"{text} [origin={origin}; support={mode}; подтверждений={conf}{link}]"
 
 
 async def _auto_rag(session_id: int, topic: str, last_expert_text: str) -> list[str]:
@@ -71,20 +73,26 @@ async def _auto_rag(session_id: int, topic: str, last_expert_text: str) -> list[
     Facts split by author: a returning expert's OWN past statements must not be
     presented as 'чужие' (the agent would ask him to cross-check himself) —
     those are 'already told, don't re-ask' context instead."""
-    if not embed.enabled() or not last_expert_text.strip():
+    if not last_expert_text.strip():
         return []
-    vec = await embed.embed(last_expert_text, query=True)
-    if vec is None:
+    if not embed.enabled() and not (
+        config.HYBRID_RAG_ENABLED or config.HYBRID_RAG_SHADOW
+    ):
         return []
-    rows = await db.search_canonical(
-        topic, vec, limit=_RAG_ITEMS, exclude_session=session_id
+    sess = await db.get_session(session_id)
+    if sess is None:
+        return []
+    rows = await retrieval.retrieve_context(
+        sess["workspace_id"], sess["topic_id"], sess["user_id"],
+        last_expert_text, session_id=session_id, limit=_RAG_ITEMS,
     )
     if not rows:
         return []
-    sess = await db.get_session(session_id)
-    me = sess["expert_name"] if sess else ""
-    mine = [r for r in rows if r["expert_name"] == me]
-    others = [r for r in rows if r["expert_name"] != me]
+    me = sess["user_id"]
+    mine = [r for r in rows if set(r.get("user_ids") or []) == {me}]
+    others = [r for r in rows if any(
+        user_id != me for user_id in (r.get("user_ids") or [r.get("user_id")])
+    )]
     out: list[str] = []
     if mine:
         out += [
@@ -131,7 +139,11 @@ async def build(
     else:
         lines.append("План ещё не задан — после разогрева вызови update_plan.")
 
-    summary = await db.topic_summary(topic)
+    sess = await db.get_session(session_id)
+    summary = (
+        await db.topic_summary(sess["workspace_id"], sess["topic_id"])
+        if sess is not None else None
+    )
     if summary:
         trimmed = _summary_excerpt(summary)
         lines.append("")
@@ -140,19 +152,5 @@ async def build(
         lines.append(trimmed)
 
     lines.extend(await _auto_rag(session_id, topic, last_expert_text))
-
-    # Session token budget: soft cap nudges wrap-up, hard cap forces end.
-    if config.HARD_CAP_TOKENS and tokens_used >= config.HARD_CAP_TOKENS:
-        lines.append("")
-        lines.append(
-            "БЮДЖЕТ ИСЧЕРПАН. Заверши сейчас: вызови end_session с резюме "
-            "собранного, новых вопросов не задавай."
-        )
-    elif config.SOFT_CAP_TOKENS and tokens_used >= config.SOFT_CAP_TOKENS:
-        lines.append("")
-        lines.append(
-            "Бюджет на исходе — закругляйся: покрой самое важное из оставшегося "
-            "и завершай."
-        )
 
     return "\n".join(lines)

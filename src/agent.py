@@ -2,7 +2,7 @@
 import logging
 from typing import Any
 
-from . import config, db, llm, prompts, state, tools
+from . import db, dialogue_context, llm, prompts, state, tools
 
 log = logging.getLogger("agent")
 
@@ -13,7 +13,7 @@ async def _build_messages(
     """Returns (messages, state_block). The state block is handed back separately
     so callers can surface it (verbose/debug mode shows the exact context the
     model saw), not just embed it into the prompt."""
-    rows = await db.history(session_id)
+    rows, compact_summary, compaction_backlog = await dialogue_context.build(session_id)
     # System prompt is stable; the dynamic STATE block rides on the tail of the
     # last user turn (keeps the system message stable, injects fresh state).
     messages: list[dict[str, Any]] = [
@@ -26,9 +26,15 @@ async def _build_messages(
     state_block = await state.build(
         session_id, topic, tokens_used, last_expert_text=last_expert_text
     )
+    dynamic_blocks = [
+        block for block in (
+            dialogue_context.memory_block(compact_summary, compaction_backlog),
+            state_block,
+        ) if block
+    ]
     for msg in reversed(turns):
         if msg["role"] == "user":
-            msg["content"] = f"{msg['content']}\n\n{state_block}"
+            msg["content"] = f"{msg['content']}\n\n" + "\n\n".join(dynamic_blocks)
             break
     messages.extend(turns)
     return messages, state_block
@@ -61,9 +67,23 @@ async def run_turn(session_id: int, topic: str) -> tuple[str, bool, dict[str, An
             return f"тул {name} упал с внутренней ошибкой — продолжай без него"
 
     rounds: list[dict[str, Any]] = []
-    text, spent = await llm.dialogue(
-        messages, tools.active_tools(), apply_tool, rounds_out=rounds
-    )
+    try:
+        text, spent = await llm.dialogue(
+            messages, tools.active_tools(), apply_tool, rounds_out=rounds,
+        )
+    except llm.DialogueContextExceeded as exc:
+        spent = exc.spent
+        total = await db.add_tokens(session_id, spent) if spent else tokens_used
+        text = (
+            "Текущий prompt не помещается в окно модели. История сохранена; "
+            "попробуйте отправить более короткое сообщение."
+        )
+        await db.add_message(session_id, "assistant", text, tool_calls=used or None)
+        trace = {
+            "tools": used, "state": state_block, "spent": spent,
+            "total": total, "rounds": rounds, "context_exceeded": True,
+        }
+        return text, False, trace
     total = await db.add_tokens(session_id, spent)
     if used:
         log.info("session=%s tools=%s spent=%s total=%s",
@@ -81,11 +101,5 @@ async def run_turn(session_id: int, topic: str) -> tuple[str, bool, dict[str, An
         return final, True, trace
 
     await db.add_message(session_id, "assistant", text, tool_calls=tool_calls)
-
-    # Hard-cap safety net: if the model blew past the budget without ending, stop
-    # the session ourselves (the STATE instruction is the softer first line).
-    if config.HARD_CAP_TOKENS and total >= config.HARD_CAP_TOKENS:
-        await db.finish_session(session_id)
-        return text, True, trace
 
     return text, False, trace

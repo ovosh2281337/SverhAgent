@@ -21,7 +21,8 @@ async def _legacy_sessions(topic: str | None) -> list[dict]:
     p = await db.pool()
     rows = await p.fetch(
         """
-        SELECT s.id, s.topic, s.expert_name, count(old.id) AS legacy_items
+        SELECT s.id,s.workspace_id,s.topic_id,s.topic,s.expert_name,
+               count(old.id) AS legacy_items
         FROM sessions s
         JOIN extracted_items old ON old.session_id=s.id
         WHERE s.status='extracted'
@@ -33,7 +34,7 @@ async def _legacy_sessions(topic: str | None) -> list[dict]:
                 AND current.grounding_version=$2
                 AND current.grounding_status<>'legacy'
           )
-        GROUP BY s.id, s.topic, s.expert_name
+        GROUP BY s.id,s.workspace_id,s.topic_id,s.topic,s.expert_name
         ORDER BY s.id
         """,
         topic, config.GROUNDING_VERSION,
@@ -59,7 +60,7 @@ async def _run(args) -> int:
     if args.dry_run:
         return 0
 
-    touched_topics: set[str] = set()
+    touched_topics: set[tuple[int, int, str]] = set()
     ok = 0
     failed = 0
     for s in sessions:
@@ -67,7 +68,7 @@ async def _run(args) -> int:
         try:
             n = await extract.run(s["id"], trace, reprocess_legacy=True)
             ok += 1
-            touched_topics.add(s["topic"])
+            touched_topics.add((s["workspace_id"], s["topic_id"], s["topic"]))
             print(f"#{s['id']}: verified={n}")
             if trace:
                 print("\n".join(trace))
@@ -76,9 +77,9 @@ async def _run(args) -> int:
             print(f"#{s['id']}: FAILED {type(exc).__name__}: {exc}")
 
     if not args.no_summary:
-        for topic in sorted(touched_topics):
+        for workspace_id, topic_id, topic in sorted(touched_topics):
             try:
-                rebuilt = await summary.run(topic)
+                rebuilt = await summary.run(workspace_id, topic_id)
                 print(f"summary[{topic}]: {'rebuilt' if rebuilt else 'skipped'}")
             except Exception as exc:
                 failed += 1

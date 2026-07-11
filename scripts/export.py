@@ -3,8 +3,7 @@ business-facing artifact (hand to a methodologist, feed to a RAG pipeline,
 attach to a report). Canonical items only, grouped by type, with reliability
 signals (confirmations, origin, contradictions) and quote provenance.
 
-Run: python -m scripts.export [topic] [outfile]
-Default: topic 'default' -> kb_default.md
+Run: python -m scripts.export WORKSPACE_ID TOPIC_ID [outfile]
 """
 import asyncio
 import json
@@ -109,10 +108,16 @@ def _render(topic: str, rows, summary: str | None) -> str:
 
 
 async def main() -> None:
-    topic = sys.argv[1] if len(sys.argv) > 1 else "default"
-    outfile = sys.argv[2] if len(sys.argv) > 2 else f"kb_{topic}.md"
-    rows = await db.canonical_for_topic(topic)
-    summary = await db.topic_summary(topic)
+    if len(sys.argv) < 3:
+        raise SystemExit("usage: python -m scripts.export WORKSPACE_ID TOPIC_ID [outfile]")
+    workspace_id, topic_id = int(sys.argv[1]), int(sys.argv[2])
+    topic_row = await db.get_topic(workspace_id, topic_id)
+    if topic_row is None:
+        raise SystemExit("topic does not belong to workspace")
+    topic = topic_row["name"]
+    outfile = sys.argv[3] if len(sys.argv) > 3 else f"kb_{workspace_id}_{topic_id}.md"
+    rows = await db.canonical_for_topic(workspace_id, topic_id)
+    summary = await db.topic_summary(workspace_id, topic_id)
     if not rows:
         print(f"по теме '{topic}' записей нет")
         await db.close()

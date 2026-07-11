@@ -9,8 +9,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import BotCommand, Message
 
 from . import agent, config, db, embed, stt
-from .jobs import eval as evaljob
-from .jobs import extract, summary
+from .jobs import worker
 
 _PLED = 3500  # Telegram message cap is 4096; leave headroom
 
@@ -67,17 +66,28 @@ async def _active_session_for_msg(msg: Message):
     user_id = _telegram_user_id(msg)
     if user_id is None:
         return None
-    return await db.active_session_for_user(user_id)
+    return await db.open_session_for_user(user_id)
+
+
+def _is_private(msg: Message) -> bool:
+    return getattr(msg.chat, "type", "private") == "private"
+
+
+@dp.message(F.chat.type != "private")
+async def reject_group_chat(msg: Message) -> None:
+    await msg.answer("Групповые чаты отключены: модель доступа пока только для private chat.")
 
 
 @dp.message(Command("start"))
 async def on_start(msg: Message, command: CommandObject) -> None:
+    if not _is_private(msg):
+        return
     topic = (command.args or "default").strip()
     user_id = _telegram_user_id(msg)
     if user_id is None:
         await msg.answer("Не могу определить Telegram user_id. Напишите боту из обычного пользовательского аккаунта.")
         return
-    existing = await db.active_session_for_user(user_id)
+    existing = await db.open_session_for_user(user_id)
     if existing:
         await msg.answer(
             "У вас уже есть активная сессия. Продолжайте отвечать, "
@@ -85,12 +95,19 @@ async def on_start(msg: Message, command: CommandObject) -> None:
         )
         return
     try:
+        access = await db.ensure_user_workspace(
+            user_id, _telegram_username(msg), _telegram_full_name(msg)
+        )
+        topic_row = await db.resolve_topic(access["workspace_id"], topic)
         await db.create_session(
             _expert_name(msg),
             topic,
             telegram_user_id=user_id,
             telegram_username=_telegram_username(msg),
             telegram_full_name=_telegram_full_name(msg),
+            user_id=access["user_id"],
+            workspace_id=access["workspace_id"],
+            topic_id=topic_row["id"],
         )
     except db.ActiveSessionExistsError:
         await msg.answer(
@@ -107,6 +124,9 @@ async def on_finish(msg: Message) -> None:
     if not sess:
         await msg.answer("Активной сессии нет. /start чтобы начать.")
         return
+    if sess["status"] == "draft_review":
+        await _show_review(msg, sess["id"])
+        return
     lock = await _acquire_lifecycle_lock(
         msg,
         sess["id"],
@@ -114,27 +134,107 @@ async def on_finish(msg: Message) -> None:
     )
     if lock is None:
         return
-    postprocess_args = None
+    review_ready = False
     no_active_after_wait = False
     try:
         fresh = await _fresh_active_session_for_msg(msg, sess["id"])
         if not fresh:
             no_active_after_wait = True
         else:
-            await db.finish_session(fresh["id"])
-            postprocess_args = (fresh["id"], fresh["topic"])
+            review_ready = await db.begin_review(fresh["id"])
     finally:
         lock.release()
     if no_active_after_wait:
         await msg.answer("Активной сессии нет. /start чтобы начать.")
         return
-    if postprocess_args is None:
-        log.error("finish lifecycle ended without postprocess args: session=%s", sess["id"])
+    if not review_ready:
+        log.error("finish lifecycle did not enter draft_review: session=%s", sess["id"])
         await msg.answer("Не смог завершить сессию — сбой на моей стороне.")
         return
-    await msg.answer("Сессия завершена. Запускаю обработку…")
-    session_id, topic = postprocess_args
-    asyncio.create_task(_postprocess(msg.bot, msg.chat.id, session_id, topic))
+    await msg.answer("Интервью завершено. Проверьте черновик перед публикацией.")
+    await _show_review(msg, sess["id"])
+
+
+async def _show_review(msg: Message, session_id: int) -> None:
+    rows = await db.review_items(session_id)
+    live = [r for r in rows if not r["deleted"]]
+    lines = ["Черновик экспертных пунктов:", ""]
+    lines.extend(f"{r['ord']}. {r['text']}" for r in live)
+    lines += [
+        "",
+        "/edit N новый текст — исправить",
+        "/delete N — удалить",
+        "/add текст — добавить",
+        "/approve — подтвердить и запустить публикацию",
+    ]
+    await _send_long(msg, "\n".join(lines))
+
+
+async def _draft_for_msg(msg: Message):
+    sess = await _active_session_for_msg(msg)
+    if not sess or sess["status"] != "draft_review":
+        await msg.answer("Нет черновика на проверке. Сначала завершите интервью: /finish.")
+        return None
+    return sess
+
+
+@dp.message(Command("review"))
+async def on_review(msg: Message) -> None:
+    sess = await _draft_for_msg(msg)
+    if sess:
+        await _show_review(msg, sess["id"])
+
+
+@dp.message(Command("edit"))
+async def on_edit(msg: Message, command: CommandObject) -> None:
+    sess = await _draft_for_msg(msg)
+    if not sess:
+        return
+    raw = (command.args or "").strip().split(maxsplit=1)
+    if len(raw) != 2 or not raw[0].isdigit() or not raw[1].strip():
+        await msg.answer("Формат: /edit N новый текст")
+        return
+    if not await db.update_review_item(sess["id"], int(raw[0]), raw[1]):
+        await msg.answer("Пункт не найден.")
+        return
+    await _show_review(msg, sess["id"])
+
+
+@dp.message(Command("delete"))
+async def on_delete(msg: Message, command: CommandObject) -> None:
+    sess = await _draft_for_msg(msg)
+    if not sess:
+        return
+    raw = (command.args or "").strip()
+    if not raw.isdigit() or not await db.delete_review_item(sess["id"], int(raw)):
+        await msg.answer("Формат: /delete N; пункт должен существовать.")
+        return
+    await _show_review(msg, sess["id"])
+
+
+@dp.message(Command("add"))
+async def on_add(msg: Message, command: CommandObject) -> None:
+    sess = await _draft_for_msg(msg)
+    if not sess:
+        return
+    text = (command.args or "").strip()
+    if not text:
+        await msg.answer("Формат: /add текст пункта")
+        return
+    await db.add_review_item(sess["id"], text)
+    await _show_review(msg, sess["id"])
+
+
+@dp.message(Command("approve"))
+async def on_approve(msg: Message) -> None:
+    sess = await _draft_for_msg(msg)
+    if not sess:
+        return
+    ok = await db.approve_review(sess["id"], sess["user_id"], msg.chat.id)
+    if not ok:
+        await msg.answer("Не удалось подтвердить: черновик пуст или уже закрыт.")
+        return
+    await msg.answer("Черновик подтверждён. Durable job поставлен в очередь.")
 
 
 @dp.message(Command("plan"))
@@ -158,6 +258,15 @@ async def on_plan(msg: Message) -> None:
 async def on_verbose(msg: Message) -> None:
     """Toggle debug mode: show the full pipeline (tool calls, token spend, the
     STATE context, transcriptions) after each reply. Off restores the original UX."""
+    user_id = _telegram_user_id(msg)
+    if user_id is None:
+        return
+    access = await db.ensure_user_workspace(
+        user_id, _telegram_username(msg), _telegram_full_name(msg)
+    )
+    if access["role"] not in {"owner", "admin"}:
+        await msg.answer("/verbose доступен только администратору workspace.")
+        return
     chat = msg.chat.id
     new = not _verbose.get(chat, False)
     _verbose[chat] = new
@@ -198,7 +307,9 @@ async def on_reset(msg: Message) -> None:
         return
     no_active_after_wait = False
     try:
-        fresh = await _fresh_active_session_for_msg(msg, sess["id"])
+        fresh = await _fresh_owned_session_for_msg(
+            msg, sess["id"], {"active", "draft_review"}
+        )
         if not fresh:
             no_active_after_wait = True
         else:
@@ -248,13 +359,19 @@ async def _fresh_active_session_for_msg(msg: Message, session_id: int):
     may have been finished or deleted. This check prevents stale handlers from
     mutating a non-active or no-longer-owned session.
     """
+    return await _fresh_owned_session_for_msg(msg, session_id, {"active"})
+
+
+async def _fresh_owned_session_for_msg(
+    msg: Message, session_id: int, statuses: set[str]
+):
     user_id = _telegram_user_id(msg)
     if user_id is None:
         return None
     sess = await db.get_session(session_id)
     if not sess:
         return None
-    if sess["status"] != "active":
+    if sess["status"] not in statuses:
         return None
     if sess["telegram_user_id"] != user_id:
         return None
@@ -346,12 +463,6 @@ async def _send_long(msg: Message, text: str) -> None:
         await msg.answer(c)
 
 
-async def _send_long_chat(bot: Bot, chat_id: int, text: str) -> None:
-    """Chat-id variant (postprocess runs without a Message to reply to)."""
-    for c in _chunk_msg(text):
-        await bot.send_message(chat_id, c)
-
-
 async def _expert_turn(msg: Message, sess, text: str) -> None:
     """Record one expert message, run the agent turn, reply. Shared by the text
     and voice handlers — voice differs only in how `text` was obtained."""
@@ -395,8 +506,8 @@ async def _expert_turn(msg: Message, sess, text: str) -> None:
     if _verbose.get(msg.chat.id):
         await _send_long(msg, _trace_text(trace))
     if finished:
-        await msg.answer("Спасибо! Обрабатываю записанное…")
-        asyncio.create_task(_postprocess(msg.bot, msg.chat.id, fresh["id"], fresh["topic"]))
+        await msg.answer("Спасибо! Проверьте черновик перед публикацией.")
+        await _show_review(msg, fresh["id"])
 
 
 @dp.message(F.text)
@@ -404,6 +515,12 @@ async def on_text(msg: Message) -> None:
     sess = await _active_session_for_msg(msg)
     if not sess:
         await msg.answer("Нет активной сессии. Наберите /start чтобы начать.")
+        return
+    if sess["status"] == "draft_review":
+        await msg.answer("Интервью на проверке. /review, затем /approve.")
+        return
+    if sess["status"] != "active":
+        await msg.answer("Интервью уже подтверждено и обрабатывается.")
         return
     await _expert_turn(msg, sess, msg.text)
 
@@ -413,6 +530,9 @@ async def on_voice(msg: Message) -> None:
     sess = await _active_session_for_msg(msg)
     if not sess:
         await msg.answer("Нет активной сессии. Наберите /start чтобы начать.")
+        return
+    if sess["status"] != "active":
+        await msg.answer("Интервью закрыто для новых ответов. Используйте /review.")
         return
     if not stt.enabled():
         await msg.answer("Голосовые пока не подключены — напишите текстом, пожалуйста.")
@@ -469,43 +589,10 @@ def _recap(rows) -> str:
     return text
 
 
-async def _postprocess(bot: Bot, chat_id: int, session_id: int, topic: str) -> None:
-    # In verbose mode the whole post-finish LLM pipeline (extract → dedup judge →
-    # summary → eval) is surfaced stage by stage; a fresh list per stage is sent
-    # as its own message so the expert sees exactly what the model did, not just
-    # the final recap. `None` (default) keeps the jobs silent for CLI/selftest.
-    vb = _verbose.get(chat_id)
-    try:
-        tr: list[str] | None = [] if vb else None
-        n = await extract.run(session_id, tr)
-        if tr:
-            await _send_long_chat(bot, chat_id, "\n".join(tr))
-        tr = [] if vb else None
-        await summary.run(topic, tr)
-        if tr:
-            await _send_long_chat(bot, chat_id, "\n".join(tr))
-        log.info("postprocess done: session=%s items=%s topic=%s", session_id, n, topic)
-        rows = await db.extracted_for_session(session_id)
-        await bot.send_message(chat_id, _recap(rows))
-        # Offline question-quality scoring — cheap judge, out of the interview
-        # token budget. Never let its failure hide a successful extraction.
-        try:
-            tr = [] if vb else None
-            scored = await evaljob.run(session_id, tr)
-            if tr:
-                await _send_long_chat(bot, chat_id, "\n".join(tr))
-            log.info("eval done: session=%s scored=%s", session_id, scored)
-        except Exception:
-            log.exception("eval failed session=%s", session_id)
-    except Exception:
-        log.exception("postprocess failed session=%s", session_id)
-        try:
-            await bot.send_message(chat_id, "Не смог обработать сессию — сбой на моей стороне.")
-        except Exception:
-            pass
-
-
 async def main() -> None:
+    worker_stop: asyncio.Event | None = None
+    worker_task: asyncio.Task | None = None
+    polling_task: asyncio.Task | None = None
     try:
         applied = await db.migrate()  # bring schema up to date before serving
         if applied:
@@ -517,15 +604,42 @@ async def main() -> None:
         else:
             log.warning("embeddings intentionally disabled: EMBED_MODE=%s", config.EMBED_MODE)
         bot = Bot(config.TELEGRAM_BOT_TOKEN)
+        worker_stop = asyncio.Event()
+
+        async def _notify(job, rows) -> None:
+            if job["chat_id"] is not None:
+                await bot.send_message(job["chat_id"], _recap(rows))
+
+        worker_task = asyncio.create_task(
+            worker.run(worker_stop, _notify), name="durable-postprocess-worker"
+        )
         await bot.set_my_commands([
+            BotCommand(command="review", description="Показать черновик"),
+            BotCommand(command="approve", description="Подтвердить черновик"),
             BotCommand(command="start", description="Начать интервью (/start тема)"),
             BotCommand(command="plan", description="Показать план и прогресс интервью"),
             BotCommand(command="finish", description="Завершить и обработать"),
             BotCommand(command="verbose", description="Показать/скрыть внутреннюю работу (отладка)"),
             BotCommand(command="reset", description="Удалить активную сессию, начать с нуля"),
         ])
-        await dp.start_polling(bot)
+        polling_task = asyncio.create_task(dp.start_polling(bot), name="telegram-polling")
+        done, _ = await asyncio.wait(
+            {polling_task, worker_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if worker_task in done:
+            error = worker_task.exception()
+            if error is not None:
+                raise error
+            raise RuntimeError("durable postprocess worker stopped unexpectedly")
+        await polling_task
     finally:
+        if polling_task is not None and not polling_task.done():
+            polling_task.cancel()
+            await asyncio.gather(polling_task, return_exceptions=True)
+        if worker_stop is not None:
+            worker_stop.set()
+        if worker_task is not None:
+            await asyncio.gather(worker_task, return_exceptions=True)
         await db.close()
 
 

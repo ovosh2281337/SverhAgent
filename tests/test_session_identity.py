@@ -31,6 +31,9 @@ class SessionIdentityTests(unittest.IsolatedAsyncioTestCase):
                 telegram_user_id=42,
                 telegram_username="same_name",
                 telegram_full_name="Same Name",
+                user_id=7,
+                workspace_id=8,
+                topic_id=9,
             )
 
         sql = fake.fetchrow.await_args.args[0]
@@ -44,6 +47,7 @@ class SessionIdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[4], 42)
         self.assertEqual(args[5], "same_name")
         self.assertEqual(args[6], "Same Name")
+        self.assertEqual(args[7:10], (7, 8, 9))
 
     async def test_invalid_telegram_user_id_is_rejected_before_db(self) -> None:
         fake = _FakePool()

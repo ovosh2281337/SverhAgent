@@ -17,8 +17,14 @@ def _json(value, fallback):
 
 
 async def main() -> None:
-    topic = sys.argv[1] if len(sys.argv) > 1 else "default"
-    rows = await db.all_for_topic(topic)
+    if len(sys.argv) < 3:
+        raise SystemExit("usage: python -m scripts.view WORKSPACE_ID TOPIC_ID")
+    workspace_id, topic_id = int(sys.argv[1]), int(sys.argv[2])
+    topic_row = await db.get_topic(workspace_id, topic_id)
+    if topic_row is None:
+        raise SystemExit("topic does not belong to workspace")
+    topic = topic_row["name"]
+    rows = await db.all_for_topic(workspace_id, topic_id)
 
     print(f"=== Извлечённые элементы (тема: {topic}, всего {len(rows)}) ===\n")
     for r in rows:
@@ -47,7 +53,7 @@ async def main() -> None:
             print(f"  legacy_quote: {r['quote']}")
         print()
 
-    summary = await db.topic_summary(topic)
+    summary = await db.topic_summary(workspace_id, topic_id)
     print("=== Сводка по теме ===\n")
     print(summary or "(ещё не собрана)")
     await db.close()
